@@ -40,6 +40,63 @@ CalibrationPoint calibration_tables[2][3] = {
   }
 };
 
+#define CAL_START_BUTTON_PIN GPIO_PIN_4
+#define CAL_START_BUTTON_PORT GPIOB
+#define CAL_NEXT_BUTTON_PIN GPIO_PIN_5
+#define CAL_NEXT_BUTTON_PORT GPIOB
+
+float read_sensor_voltage(uint8_t sensor_idx) {
+  ADC_ChannelConfTypeDef sConfig = {0};
+  float voltage = 0.0f;
+
+  if (sensor_idx == 0) {
+    sConfig.Channel = ADC_CHANNEL_0;
+  } else {
+    sConfig.Channel = ADC_CHANNEL_1;
+  }
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+  
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+    Error_Handler();
+  }
+
+  HAL_ADC_Start(&hadc1);
+  if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+    uint32_t rawValue = HAL_ADC_GetValue(&hadc1);
+    voltage = (float)rawValue * 3.3f / 4095.0f;
+  }
+  HAL_ADC_Stop(&hadc1);
+  
+  return voltage;
+}
+
+void calibration() {
+  float diameters[] = {1.50f, 1.75f, 2.00f};
+  
+  // Loop through both sensors
+  for (int s = 0; s < 2; s++) {
+    // Loop through 3 calibration points
+    for (int p = 0; p < 3; p++) {
+      // Wait for Next Button Press (Active Low)
+      while(HAL_GPIO_ReadPin(CAL_NEXT_BUTTON_PORT, CAL_NEXT_BUTTON_PIN) == GPIO_PIN_SET) {
+        HAL_Delay(10);
+      }
+      HAL_Delay(50); // Debounce press
+
+      // Record value
+      calibration_tables[s][p].voltage = read_sensor_voltage(s);
+      calibration_tables[s][p].diameter_mm = diameters[p];
+
+      // Wait for Next Button Release
+      while(HAL_GPIO_ReadPin(CAL_NEXT_BUTTON_PORT, CAL_NEXT_BUTTON_PIN) == GPIO_PIN_RESET) {
+        HAL_Delay(10);
+      }
+      HAL_Delay(50); // Debounce release
+    }
+  }
+}
+
 float convert_voltage_to_mm(float voltage, uint8_t sensor_idx) {
   if (sensor_idx >= 2) return 1.75f; // Safety check
 
@@ -66,39 +123,15 @@ float convert_voltage_to_mm(float voltage, uint8_t sensor_idx) {
 }
 
 void measure_sensor_values() {
-  ADC_ChannelConfTypeDef sConfig = {0};
   float voltage;
 
   // --- Read Sensor 1 (Channel 0 / PA0) ---
-  sConfig.Channel = ADC_CHANNEL_0;
-  sConfig.Rank = 1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
-    Error_Handler();
-  }
-
-  HAL_ADC_Start(&hadc1);
-  if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
-    uint32_t rawValue = HAL_ADC_GetValue(&hadc1);
-    voltage = (float)rawValue * 3.3f / 4095.0f;
-    sensor1_mm = convert_voltage_to_mm(voltage, 0);
-  }
-  HAL_ADC_Stop(&hadc1);
+  voltage = read_sensor_voltage(0);
+  sensor1_mm = convert_voltage_to_mm(voltage, 0);
 
   // --- Read Sensor 2 (Channel 1 / PA1) ---
-  sConfig.Channel = ADC_CHANNEL_1;
-  // Rank 1 is reused for the single conversion
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
-    Error_Handler();
-  }
-
-  HAL_ADC_Start(&hadc1);
-  if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
-    uint32_t rawValue = HAL_ADC_GetValue(&hadc1);
-    voltage = (float)rawValue * 3.3f / 4095.0f;
-    sensor2_mm = convert_voltage_to_mm(voltage, 1);
-  }
-  HAL_ADC_Stop(&hadc1);
+  voltage = read_sensor_voltage(1);
+  sensor2_mm = convert_voltage_to_mm(voltage, 1);
 }
 
 // Buffer to send to printer: 2 axes * 5 bytes = 10 bytes
@@ -150,6 +183,15 @@ int main(void)
 
   while (1)
   {
+    // Check for Calibration Start Button (Active Low)
+    if (HAL_GPIO_ReadPin(CAL_START_BUTTON_PORT, CAL_START_BUTTON_PIN) == GPIO_PIN_RESET) {
+      // Debounce
+      HAL_Delay(50);
+      if (HAL_GPIO_ReadPin(CAL_START_BUTTON_PORT, CAL_START_BUTTON_PIN) == GPIO_PIN_RESET) {
+        calibration();
+      }
+    }
+
     // 1. Update sensor readings
     measure_sensor_values();
     
@@ -303,6 +345,28 @@ void Error_Handler(void)
   {
     // Stay here in case of error
   }
+}
+
+/**
+ * @brief GPIO Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pins : PB4 PB5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 }
 
 #ifdef  USE_FULL_ASSERT
