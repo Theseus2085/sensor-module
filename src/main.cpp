@@ -5,18 +5,101 @@
 
 #include "stm32f4xx_hal.h"
 #include <string.h>
+#include <math.h>
 
 /* 
  * TODO: Set this address to match FILWIDTH_SENSOR_I2C_ADDRESS in your Marlin configuration.
  * Note: HAL expects the address shifted left by 1.
  */
-#define SENSOR_I2C_ADDRESS 0x40 
+#define SENSOR_I2C_ADDRESS 0x42 
 
 I2C_HandleTypeDef hi2c1;
+ADC_HandleTypeDef hadc1;
 
 // Dummy sensor values - In a real application, read these from ADC/Sensor
 float sensor1_mm = 1.75f;
 float sensor2_mm = 1.75f;
+
+struct CalibrationPoint {
+  float voltage;
+  float diameter_mm;
+};
+
+// Calibration tables for 2 sensors, each with 3 points (Low, Nominal, High)
+// TODO: Update these values with actual calibration data for each sensor
+CalibrationPoint calibration_tables[2][3] = {
+  { // Sensor 1 Table
+    {1.0f, 1.50f},  // Point 1
+    {1.65f, 1.75f}, // Point 2
+    {2.3f, 2.00f}   // Point 3
+  },
+  { // Sensor 2 Table
+    {1.0f, 1.50f},  // Point 1
+    {1.65f, 1.75f}, // Point 2
+    {2.3f, 2.00f}   // Point 3
+  }
+};
+
+float convert_voltage_to_mm(float voltage, uint8_t sensor_idx) {
+  if (sensor_idx >= 2) return 1.75f; // Safety check
+
+  const CalibrationPoint* table = calibration_tables[sensor_idx];
+
+  // Linear interpolation between points
+  // Assumes table is sorted by voltage
+  
+  if (voltage <= table[1].voltage) {
+    // Interpolate between Point 1 and Point 2
+    float denom = table[1].voltage - table[0].voltage;
+    if (fabs(denom) < 0.0001f) return table[0].diameter_mm;
+    
+    float slope = (table[1].diameter_mm - table[0].diameter_mm) / denom;
+    return table[0].diameter_mm + slope * (voltage - table[0].voltage);
+  } else {
+    // Interpolate between Point 2 and Point 3
+    float denom = table[2].voltage - table[1].voltage;
+    if (fabs(denom) < 0.0001f) return table[1].diameter_mm;
+
+    float slope = (table[2].diameter_mm - table[1].diameter_mm) / denom;
+    return table[1].diameter_mm + slope * (voltage - table[1].voltage);
+  }
+}
+
+void measure_sensor_values() {
+  ADC_ChannelConfTypeDef sConfig = {0};
+  float voltage;
+
+  // --- Read Sensor 1 (Channel 0 / PA0) ---
+  sConfig.Channel = ADC_CHANNEL_0;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+    Error_Handler();
+  }
+
+  HAL_ADC_Start(&hadc1);
+  if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+    uint32_t rawValue = HAL_ADC_GetValue(&hadc1);
+    voltage = (float)rawValue * 3.3f / 4095.0f;
+    sensor1_mm = convert_voltage_to_mm(voltage, 0);
+  }
+  HAL_ADC_Stop(&hadc1);
+
+  // --- Read Sensor 2 (Channel 1 / PA1) ---
+  sConfig.Channel = ADC_CHANNEL_1;
+  // Rank 1 is reused for the single conversion
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+    Error_Handler();
+  }
+
+  HAL_ADC_Start(&hadc1);
+  if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+    uint32_t rawValue = HAL_ADC_GetValue(&hadc1);
+    voltage = (float)rawValue * 3.3f / 4095.0f;
+    sensor2_mm = convert_voltage_to_mm(voltage, 1);
+  }
+  HAL_ADC_Stop(&hadc1);
+}
 
 // Buffer to send to printer: 2 axes * 5 bytes = 10 bytes
 uint8_t tx_buffer[10];
@@ -25,6 +108,7 @@ uint8_t tx_buffer[10];
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_ADC1_Init(void);
 void Error_Handler(void);
 
 /**
@@ -62,12 +146,12 @@ int main(void)
   SystemClock_Config();
   MX_GPIO_Init();
   MX_I2C1_Init();
+  MX_ADC1_Init();
 
   while (1)
   {
-    // 1. Update sensor readings (Simulated here)
-    // In real code: Read ADC, calculate width
-    // sensor1_mm = read_sensor_1();
+    // 1. Update sensor readings
+    measure_sensor_values();
     
     // 2. Prepare the buffer
     update_buffer();
@@ -112,26 +196,56 @@ static void MX_I2C1_Init(void)
 }
 
 /**
- * @brief GPIO Initialization Function
+ * @brief ADC1 Initialization Function
  * @param None
  * @retval None
  */
-static void MX_GPIO_Init(void)
+static void MX_ADC1_Init(void)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+ * @brief ADC MSP Initialization
+ * This function configures the hardware resources used in this example
+ * @param adcHandle: ADC handle pointer
+ * @retval None
+ */
+void HAL_ADC_MspInit(ADC_HandleTypeDef* adcHandle)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
+  if(adcHandle->Instance==ADC1)
+  {
+    /* ADC1 clock enable */
+    __HAL_RCC_ADC1_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
 
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  /**I2C1 GPIO Configuration
-  PB8     ------> I2C1_SCL
-  PB9     ------> I2C1_SDA
-  */
-  GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    /**ADC1 GPIO Configuration
+    PA0     ------> ADC1_IN0
+    PA1     ------> ADC1_IN1
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  }
 }
 
 /**
