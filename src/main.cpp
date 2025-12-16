@@ -14,6 +14,7 @@
 #define SENSOR_I2C_ADDRESS 0x42 
 
 I2C_HandleTypeDef hi2c1;
+I2C_HandleTypeDef hi2c2;
 ADC_HandleTypeDef hadc1;
 
 // Dummy sensor values - In a real application, read these from ADC/Sensor
@@ -45,6 +46,195 @@ CalibrationPoint calibration_tables[2][3] = {
 #define CAL_NEXT_BUTTON_PIN GPIO_PIN_5
 #define CAL_NEXT_BUTTON_PORT GPIOB
 
+// --- OLED (0.96" SSD1306 assumed) on separate I2C peripheral ---
+// NOTE: Default pins for I2C2 on STM32F446: PB10=SCL, PB11=SDA (AF4)
+// Update these if your wiring differs.
+#define OLED_I2C_ADDRESS (0x3C << 1) // HAL expects 7-bit address shifted left by 1
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+
+static uint8_t oled_buffer[OLED_WIDTH * (OLED_HEIGHT / 8)];
+static uint8_t oled_cursor_x = 0;
+static uint8_t oled_cursor_page = 0;
+
+static void oled_send_command(uint8_t cmd) {
+  uint8_t packet[2] = {0x00, cmd};
+  (void)HAL_I2C_Master_Transmit(&hi2c2, OLED_I2C_ADDRESS, packet, sizeof(packet), 50);
+}
+
+static void oled_send_data(const uint8_t* data, uint16_t len) {
+  // Control byte 0x40 indicates following bytes are data.
+  // Send in small chunks to avoid large stack buffers.
+  uint8_t packet[1 + 16];
+  packet[0] = 0x40;
+  while (len > 0) {
+    uint16_t chunk = (len > 16) ? 16 : len;
+    for (uint16_t i = 0; i < chunk; i++) {
+      packet[1 + i] = data[i];
+    }
+    (void)HAL_I2C_Master_Transmit(&hi2c2, OLED_I2C_ADDRESS, packet, 1 + chunk, 100);
+    data += chunk;
+    len -= chunk;
+  }
+}
+
+static void oled_init(void) {
+  HAL_Delay(50);
+
+  oled_send_command(0xAE); // Display OFF
+  oled_send_command(0xD5); // Set display clock
+  oled_send_command(0x80);
+  oled_send_command(0xA8); // Set multiplex
+  oled_send_command(0x3F); // 64
+  oled_send_command(0xD3); // Set display offset
+  oled_send_command(0x00);
+  oled_send_command(0x40); // Set start line
+  oled_send_command(0x8D); // Charge pump
+  oled_send_command(0x14);
+  oled_send_command(0x20); // Memory mode
+  oled_send_command(0x00); // Horizontal addressing
+  oled_send_command(0xA1); // Segment remap
+  oled_send_command(0xC8); // COM scan direction
+  oled_send_command(0xDA); // COM pins
+  oled_send_command(0x12);
+  oled_send_command(0x81); // Contrast
+  oled_send_command(0x7F);
+  oled_send_command(0xD9); // Pre-charge
+  oled_send_command(0xF1);
+  oled_send_command(0xDB); // VCOM detect
+  oled_send_command(0x40);
+  oled_send_command(0xA4); // Display follows RAM
+  oled_send_command(0xA6); // Normal display
+  oled_send_command(0x2E); // Deactivate scroll
+  oled_send_command(0xAF); // Display ON
+
+  memset(oled_buffer, 0x00, sizeof(oled_buffer));
+}
+
+static void oled_set_cursor(uint8_t x, uint8_t page) {
+  if (x >= OLED_WIDTH) x = 0;
+  if (page >= (OLED_HEIGHT / 8)) page = 0;
+  oled_cursor_x = x;
+  oled_cursor_page = page;
+}
+
+static void oled_clear(void) {
+  memset(oled_buffer, 0x00, sizeof(oled_buffer));
+  oled_set_cursor(0, 0);
+}
+
+static void oled_update(void) {
+  for (uint8_t page = 0; page < (OLED_HEIGHT / 8); page++) {
+    oled_send_command((uint8_t)(0xB0 + page));
+    oled_send_command(0x00);
+    oled_send_command(0x10);
+    oled_send_data(&oled_buffer[OLED_WIDTH * page], OLED_WIDTH);
+  }
+}
+
+// Minimal 5x7-ish glyphs (columns) for: '0'..'9', 'S', '.', ' ' only.
+// LSB is top pixel within the 8-pixel page.
+static const uint8_t glyph_digits[10][5] = {
+  {0x3E, 0x51, 0x49, 0x45, 0x3E}, // 0
+  {0x00, 0x42, 0x7F, 0x40, 0x00}, // 1
+  {0x42, 0x61, 0x51, 0x49, 0x46}, // 2
+  {0x21, 0x41, 0x45, 0x4B, 0x31}, // 3
+  {0x18, 0x14, 0x12, 0x7F, 0x10}, // 4
+  {0x27, 0x45, 0x45, 0x45, 0x39}, // 5
+  {0x3C, 0x4A, 0x49, 0x49, 0x30}, // 6
+  {0x01, 0x71, 0x09, 0x05, 0x03}, // 7
+  {0x36, 0x49, 0x49, 0x49, 0x36}, // 8
+  {0x06, 0x49, 0x49, 0x29, 0x1E}  // 9
+};
+
+static const uint8_t glyph_S[5] = {0x26, 0x49, 0x49, 0x49, 0x32};
+static const uint8_t glyph_dot[5] = {0x00, 0x60, 0x60, 0x00, 0x00};
+
+static void oled_draw_glyph_5x7(const uint8_t glyph[5]) {
+  if (oled_cursor_page >= (OLED_HEIGHT / 8)) return;
+  if (oled_cursor_x + 6 > OLED_WIDTH) return;
+
+  uint16_t idx = (uint16_t)oled_cursor_page * OLED_WIDTH + oled_cursor_x;
+  for (uint8_t col = 0; col < 5; col++) {
+    oled_buffer[idx + col] = glyph[col];
+  }
+  oled_buffer[idx + 5] = 0x00; // 1-column spacing
+  oled_cursor_x = (uint8_t)(oled_cursor_x + 6);
+}
+
+static void oled_write_char(char c) {
+  if (c >= '0' && c <= '9') {
+    oled_draw_glyph_5x7(glyph_digits[c - '0']);
+    return;
+  }
+  if (c == 'S') {
+    oled_draw_glyph_5x7(glyph_S);
+    return;
+  }
+  if (c == '.') {
+    oled_draw_glyph_5x7(glyph_dot);
+    return;
+  }
+  // space or unsupported
+  static const uint8_t glyph_space[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
+  oled_draw_glyph_5x7(glyph_space);
+}
+
+static void oled_write_string(const char* s) {
+  while (*s) {
+    oled_write_char(*s++);
+  }
+}
+
+static void format_mm_3dp(float val, char out[8]) {
+  // Produces "X.XXX" (up to 9.999), always 5 chars + NUL.
+  if (val < 0.0f) val = 0.0f;
+  if (val > 9.999f) val = 9.999f;
+  uint32_t fp = (uint32_t)(val * 1000.0f + 0.5f);
+  uint32_t i = fp / 1000;
+  uint32_t f = fp % 1000;
+  out[0] = (char)('0' + (i % 10));
+  out[1] = '.';
+  out[2] = (char)('0' + ((f / 100) % 10));
+  out[3] = (char)('0' + ((f / 10) % 10));
+  out[4] = (char)('0' + (f % 10));
+  out[5] = '\0';
+}
+
+static void oled_show_normal(void) {
+  char buf[8];
+  oled_clear();
+
+  oled_set_cursor(0, 0);
+  oled_write_string("S1 ");
+  format_mm_3dp(sensor1_mm, buf);
+  oled_write_string(buf);
+
+  oled_set_cursor(0, 2);
+  oled_write_string("S2 ");
+  format_mm_3dp(sensor2_mm, buf);
+  oled_write_string(buf);
+
+  oled_update();
+}
+
+static void oled_show_cal_prompt(uint8_t sensor_idx, float ref_mm) {
+  char buf[8];
+  oled_clear();
+
+  oled_set_cursor(0, 0);
+  oled_write_string("S");
+  oled_write_char((char)('1' + sensor_idx));
+
+  oled_set_cursor(0, 2);
+  format_mm_3dp(ref_mm, buf);
+  oled_write_string(buf);
+
+  oled_update();
+}
+
+static volatile uint8_t g_calibration_mode = 0;
+
 float read_sensor_voltage(uint8_t sensor_idx) {
   ADC_ChannelConfTypeDef sConfig = {0};
   float voltage = 0.0f;
@@ -73,12 +263,17 @@ float read_sensor_voltage(uint8_t sensor_idx) {
 
 void calibration() {
   float diameters[] = {1.50f, 1.75f, 2.00f};
+
+  g_calibration_mode = 1;
   
   // Loop through both sensors
   for (int s = 0; s < 2; s++) {
     // Loop through 3 calibration points
     for (int p = 0; p < 3; p++) {
       // Wait for Next Button Press (Active Low)
+
+      oled_show_cal_prompt((uint8_t)s, diameters[p]);
+
       while(HAL_GPIO_ReadPin(CAL_NEXT_BUTTON_PORT, CAL_NEXT_BUTTON_PIN) == GPIO_PIN_SET) {
         HAL_Delay(10);
       }
@@ -95,6 +290,9 @@ void calibration() {
       HAL_Delay(50); // Debounce release
     }
   }
+
+  g_calibration_mode = 0;
+  oled_show_normal();
 }
 
 float convert_voltage_to_mm(float voltage, uint8_t sensor_idx) {
@@ -141,6 +339,7 @@ uint8_t tx_buffer[10];
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_I2C2_Init(void);
 static void MX_ADC1_Init(void);
 void Error_Handler(void);
 
@@ -179,7 +378,13 @@ int main(void)
   SystemClock_Config();
   MX_GPIO_Init();
   MX_I2C1_Init();
+  MX_I2C2_Init();
   MX_ADC1_Init();
+
+  oled_init();
+  oled_show_normal();
+
+  uint32_t last_oled_update = HAL_GetTick();
 
   while (1)
   {
@@ -189,6 +394,7 @@ int main(void)
       HAL_Delay(50);
       if (HAL_GPIO_ReadPin(CAL_START_BUTTON_PORT, CAL_START_BUTTON_PIN) == GPIO_PIN_RESET) {
         calibration();
+        last_oled_update = HAL_GetTick();
       }
     }
 
@@ -197,6 +403,15 @@ int main(void)
     
     // 2. Prepare the buffer
     update_buffer();
+
+    // Update OLED every 10 seconds in normal mode
+    if (!g_calibration_mode) {
+      uint32_t now = HAL_GetTick();
+      if ((now - last_oled_update) >= 1000U) {
+        oled_show_normal();
+        last_oled_update = now;
+      }
+    }
 
     // 3. Wait for I2C request from Printer
     // This is a blocking call with a timeout. 
@@ -234,6 +449,49 @@ static void MX_I2C1_Init(void)
   if (HAL_I2C_Init(&hi2c1) != HAL_OK)
   {
     Error_Handler();
+  }
+}
+
+/**
+ * @brief I2C2 Initialization Function (OLED master)
+ * @param None
+ * @retval None
+ */
+static void MX_I2C2_Init(void)
+{
+  hi2c2.Instance = I2C2;
+  hi2c2.Init.ClockSpeed = 400000;
+  hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c2.Init.OwnAddress1 = 0;
+  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c2.Init.OwnAddress2 = 0;
+  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  if(i2cHandle->Instance == I2C2)
+  {
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_I2C2_CLK_ENABLE();
+
+    /**I2C2 GPIO Configuration
+    PB10     ------> I2C2_SCL
+    PB11     ------> I2C2_SDA
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_11;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF4_I2C2;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
   }
 }
 
