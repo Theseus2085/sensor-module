@@ -235,6 +235,9 @@ static void oled_show_cal_prompt(uint8_t sensor_idx, float ref_mm) {
 
 static volatile uint8_t g_calibration_mode = 0;
 
+// Forward declaration (used before the main function prototypes block)
+void Error_Handler(void);
+
 float read_sensor_voltage(uint8_t sensor_idx) {
   ADC_ChannelConfTypeDef sConfig = {0};
   float voltage = 0.0f;
@@ -502,8 +505,6 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
  */
 static void MX_ADC1_Init(void)
 {
-  ADC_ChannelConfTypeDef sConfig = {0};
-
   hadc1.Instance = ADC1;
   hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
