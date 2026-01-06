@@ -14,12 +14,16 @@
 #define SENSOR_I2C_ADDRESS 0x42 
 
 I2C_HandleTypeDef hi2c1;
-I2C_HandleTypeDef hi2c2;
+// I2C2 removed - using Software I2C for OLED on D6/D3
 ADC_HandleTypeDef hadc1;
 
 // Dummy sensor values - In a real application, read these from ADC/Sensor
 float sensor1_mm = 1.75f;
 float sensor2_mm = 1.75f;
+
+// Variable to track if I2C transmission is active/pending
+volatile uint8_t i2c_tx_busy = 0;
+
 
 struct CalibrationPoint {
   float voltage;
@@ -53,29 +57,96 @@ CalibrationPoint calibration_tables[2][3] = {
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
 
+// --- Software I2C Configuration for OLED on D6 (SCL) and D3 (SDA) ---
+// D6 = PB10 (SCL)
+// D3 = PB3  (SDA)
+#define SW_I2C_SCL_PIN GPIO_PIN_10
+#define SW_I2C_SCL_PORT GPIOB
+#define SW_I2C_SDA_PIN GPIO_PIN_3
+#define SW_I2C_SDA_PORT GPIOB
+
+static void sw_i2c_delay(void) {
+  // Simple delay for ~100kHz-400kHz. Adjust based on clock speed.
+  // For 180MHz, a loop is needed.
+  for(volatile int i=0; i<50; i++) { __NOP(); }
+}
+
+static void sw_i2c_scl_hi(void) {
+  HAL_GPIO_WritePin(SW_I2C_SCL_PORT, SW_I2C_SCL_PIN, GPIO_PIN_SET);
+}
+
+static void sw_i2c_scl_lo(void) {
+  HAL_GPIO_WritePin(SW_I2C_SCL_PORT, SW_I2C_SCL_PIN, GPIO_PIN_RESET);
+}
+
+static void sw_i2c_sda_hi(void) {
+  HAL_GPIO_WritePin(SW_I2C_SDA_PORT, SW_I2C_SDA_PIN, GPIO_PIN_SET);
+}
+
+static void sw_i2c_sda_lo(void) {
+  HAL_GPIO_WritePin(SW_I2C_SDA_PORT, SW_I2C_SDA_PIN, GPIO_PIN_RESET);
+}
+
+static void sw_i2c_start(void) {
+  sw_i2c_sda_hi();
+  sw_i2c_scl_hi();
+  sw_i2c_delay();
+  sw_i2c_sda_lo();
+  sw_i2c_delay();
+  sw_i2c_scl_lo();
+}
+
+static void sw_i2c_stop(void) {
+  sw_i2c_sda_lo();
+  sw_i2c_scl_hi();
+  sw_i2c_delay();
+  sw_i2c_sda_hi();
+  sw_i2c_delay();
+}
+
+static void sw_i2c_write_byte(uint8_t byte) {
+  for(uint8_t i=0; i<8; i++) {
+    if(byte & 0x80) sw_i2c_sda_hi();
+    else sw_i2c_sda_lo();
+    sw_i2c_delay();
+    sw_i2c_scl_hi(); // Clock High
+    sw_i2c_delay();
+    sw_i2c_scl_lo(); // Clock Low
+    byte <<= 1;
+  }
+  
+  // ACK / NACK Clock Pulse
+  sw_i2c_sda_hi(); // Release SDA for ACK
+  sw_i2c_delay();
+  sw_i2c_scl_hi();
+  sw_i2c_delay();
+  // We ignore the ACK value for OLED simplicity
+  sw_i2c_scl_lo();
+}
+
 static uint8_t oled_buffer[OLED_WIDTH * (OLED_HEIGHT / 8)];
 static uint8_t oled_cursor_x = 0;
 static uint8_t oled_cursor_page = 0;
 
 static void oled_send_command(uint8_t cmd) {
-  uint8_t packet[2] = {0x00, cmd};
-  (void)HAL_I2C_Master_Transmit(&hi2c2, OLED_I2C_ADDRESS, packet, sizeof(packet), 50);
+  sw_i2c_start();
+  sw_i2c_write_byte(OLED_I2C_ADDRESS);
+  sw_i2c_write_byte(0x00); // Command stream
+  sw_i2c_write_byte(cmd);
+  sw_i2c_stop();
 }
 
 static void oled_send_data(const uint8_t* data, uint16_t len) {
-  // Control byte 0x40 indicates following bytes are data.
-  // Send in small chunks to avoid large stack buffers.
-  uint8_t packet[1 + 16];
-  packet[0] = 0x40;
-  while (len > 0) {
-    uint16_t chunk = (len > 16) ? 16 : len;
-    for (uint16_t i = 0; i < chunk; i++) {
-      packet[1 + i] = data[i];
-    }
-    (void)HAL_I2C_Master_Transmit(&hi2c2, OLED_I2C_ADDRESS, packet, 1 + chunk, 100);
-    data += chunk;
-    len -= chunk;
+  // Try to send efficiently in one transaction if possible, or chunks
+  sw_i2c_start();
+  sw_i2c_write_byte(OLED_I2C_ADDRESS);
+  sw_i2c_write_byte(0x40); // Data stream
+  
+  for(uint16_t i=0; i<len; i++) {
+      sw_i2c_write_byte(data[i]);
   }
+  
+  sw_i2c_stop();
 }
 
 static void oled_init(void) {
@@ -342,9 +413,14 @@ uint8_t tx_buffer[10];
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
-static void MX_I2C2_Init(void);
 static void MX_ADC1_Init(void);
 void Error_Handler(void);
+
+// I2C Interrupt Handlers
+extern "C" {
+  void I2C1_EV_IRQHandler(void);
+  void I2C1_ER_IRQHandler(void);
+}
 
 /**
  * @brief Formats a float diameter into the 5-byte format expected by the printer.
@@ -381,11 +457,15 @@ int main(void)
   SystemClock_Config();
   MX_GPIO_Init();
   MX_I2C1_Init();
-  MX_I2C2_Init();
   MX_ADC1_Init();
 
   oled_init();
   oled_show_normal();
+
+  // Start I2C Slave listening (Interrupt mode)
+  if (HAL_I2C_Slave_Transmit_IT(&hi2c1, tx_buffer, 10) != HAL_OK) {
+      Error_Handler();
+  }
 
   uint32_t last_oled_update = HAL_GetTick();
 
@@ -415,21 +495,6 @@ int main(void)
         last_oled_update = now;
       }
     }
-
-    // 3. Wait for I2C request from Printer
-    // This is a blocking call with a timeout. 
-    // In a production environment, consider using Interrupts (HAL_I2C_Slave_Transmit_IT)
-    // or DMA to avoid blocking the sensor reading loop.
-    if (HAL_I2C_Slave_Transmit(&hi2c1, tx_buffer, 10, 50) != HAL_OK) {
-      // If error is not just a timeout (no master request), handle it
-      if (HAL_I2C_GetError(&hi2c1) != HAL_I2C_ERROR_AF) {
-         // Reset I2C or handle error
-         // __HAL_I2C_CLEAR_FLAG(&hi2c1, ...);
-      }
-    }
-    
-    // Small delay to prevent tight loop if no I2C activity
-    // HAL_Delay(1); 
   }
 }
 
@@ -442,8 +507,6 @@ static void MX_I2C1_Init(void)
 {
   hi2c1.Instance = I2C1;
   hi2c1.Init.ClockSpeed = 100000;
-  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c1.Init.OwnAddress1 = SENSOR_I2C_ADDRESS << 1; // Shifted for HAL
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
   hi2c1.Init.OwnAddress2 = 0;
@@ -453,47 +516,59 @@ static void MX_I2C1_Init(void)
   {
     Error_Handler();
   }
+  
+  // Enable Interrupts
+  HAL_NVIC_SetPriority(I2C1_EV_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);
+  HAL_NVIC_SetPriority(I2C1_ER_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(I2C1_ER_IRQn);
 }
 
-/**
- * @brief I2C2 Initialization Function (OLED master)
- * @param None
- * @retval None
- */
-static void MX_I2C2_Init(void)
-{
-  hi2c2.Instance = I2C2;
-  hi2c2.Init.ClockSpeed = 400000;
-  hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c2.Init.OwnAddress1 = 0;
-  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c2.Init.OwnAddress2 = 0;
-  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c2) != HAL_OK)
-  {
-    Error_Handler();
-  }
+// Re-arm the I2C Slave TX after completion
+void HAL_I2C_SlaveTxCpltCallback(I2C_HandleTypeDef *hi2c) {
+    if (hi2c->Instance == I2C1) {
+        HAL_I2C_Slave_Transmit_IT(&hi2c1, tx_buffer, 10);
+    }
 }
+
+// Handle errors (like NACK or Bus Error) by re-arming
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
+    if (hi2c->Instance == I2C1) {
+        // Clear flags and restart
+        // __HAL_I2C_CLEAR_FLAG(hi2c, I2C_FLAG_BUSY); // Dangerous to force clear
+        // Simply trying to restart listening is often enough
+        HAL_I2C_Slave_Transmit_IT(&hi2c1, tx_buffer, 10);
+    }
+}
+
+// Interrupt Dispatchers
+void I2C1_EV_IRQHandler(void) {
+  HAL_I2C_EV_IRQHandler(&hi2c1);
+}
+
+void I2C1_ER_IRQHandler(void) {
+  HAL_I2C_ER_IRQHandler(&hi2c1);
+}
+
+// Removed MX_I2C2_Init as we use Software I2C on GPIOs
 
 void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-  if(i2cHandle->Instance == I2C2)
+  if(i2cHandle->Instance == I2C1) 
   {
     __HAL_RCC_GPIOB_CLK_ENABLE();
-    __HAL_RCC_I2C2_CLK_ENABLE();
+    __HAL_RCC_I2C1_CLK_ENABLE();
 
-    /**I2C2 GPIO Configuration
-    PB10     ------> I2C2_SCL
-    PB11     ------> I2C2_SDA
+    /**I2C1 GPIO Configuration
+    PB8     ------> I2C1_SCL (Arduino D15)
+    PB9     ------> I2C1_SDA (Arduino D14)
     */
-    GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_11;
+    GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-    GPIO_InitStruct.Alternate = GPIO_AF4_I2C2;
+    GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
   }
 }
@@ -614,6 +689,17 @@ void Error_Handler(void)
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* Configure SW I2C Pins: D6 (PB10) and D3 (PB3) as Output Open Drain */
+  GPIO_InitStruct.Pin = SW_I2C_SCL_PIN | SW_I2C_SDA_PIN;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD; 
+  GPIO_InitStruct.Pull = GPIO_PULLUP; // Enable internal pullups for convenience
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  // Set initial high state (Idle)
+  HAL_GPIO_WritePin(GPIOB, SW_I2C_SCL_PIN, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOB, SW_I2C_SDA_PIN, GPIO_PIN_SET);
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
