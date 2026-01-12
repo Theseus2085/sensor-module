@@ -6,6 +6,7 @@
 #include "stm32f4xx_hal.h"
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
 
 /* 
  * TODO: Set this address to match FILWIDTH_SENSOR_I2C_ADDRESS in your Marlin configuration.
@@ -14,6 +15,7 @@
 #define SENSOR_I2C_ADDRESS 0x42 
 
 I2C_HandleTypeDef hi2c1;
+UART_HandleTypeDef huart2;
 // I2C2 removed - using Software I2C for OLED on D6/D3
 ADC_HandleTypeDef hadc1;
 
@@ -308,6 +310,23 @@ static volatile uint8_t g_calibration_mode = 0;
 
 // Forward declaration (used before the main function prototypes block)
 void Error_Handler(void);
+void measure_sensor_values(void);
+static void MX_USART2_UART_Init(void);
+
+static uint32_t last_serial_print = 0;
+
+void print_debug_info(const char* status) {
+  uint32_t now = HAL_GetTick();
+  if (now - last_serial_print >= 5000) {
+    char msg[128];
+    int len = snprintf(msg, sizeof(msg), "S1: %.3fmm, S2: %.3fmm, Status: %s\r\n", 
+                       sensor1_mm, sensor2_mm, status);
+    if (len > 0) {
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 100);
+    }
+    last_serial_print = now;
+  }
+}
 
 float read_sensor_voltage(uint8_t sensor_idx) {
   ADC_ChannelConfTypeDef sConfig = {0};
@@ -337,6 +356,7 @@ float read_sensor_voltage(uint8_t sensor_idx) {
 
 void calibration() {
   float diameters[] = {1.50f, 1.75f, 2.00f};
+  char status_msg[64];
 
   g_calibration_mode = 1;
   
@@ -347,9 +367,12 @@ void calibration() {
       // Wait for Next Button Press (Active Low)
 
       oled_show_cal_prompt((uint8_t)s, diameters[p]);
+      snprintf(status_msg, sizeof(status_msg), "Calibrating S%d, Point %d (%.2fmm)", s + 1, p + 1, diameters[p]);
 
       while(HAL_GPIO_ReadPin(CAL_NEXT_BUTTON_PORT, CAL_NEXT_BUTTON_PIN) == GPIO_PIN_SET) {
         HAL_Delay(10);
+        measure_sensor_values();
+        print_debug_info(status_msg);
       }
       HAL_Delay(50); // Debounce press
 
@@ -360,6 +383,8 @@ void calibration() {
       // Wait for Next Button Release
       while(HAL_GPIO_ReadPin(CAL_NEXT_BUTTON_PORT, CAL_NEXT_BUTTON_PIN) == GPIO_PIN_RESET) {
         HAL_Delay(10);
+        measure_sensor_values();
+        print_debug_info(status_msg);
       }
       HAL_Delay(50); // Debounce release
     }
@@ -458,6 +483,7 @@ int main(void)
   MX_GPIO_Init();
   MX_I2C1_Init();
   MX_ADC1_Init();
+  MX_USART2_UART_Init();
 
   oled_init();
   oled_show_normal();
@@ -483,6 +509,7 @@ int main(void)
 
     // 1. Update sensor readings
     measure_sensor_values();
+    print_debug_info("Normal Mode");
     
     // 2. Prepare the buffer
     update_buffer();
@@ -570,6 +597,54 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  }
+}
+
+/**
+ * @brief USART2 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_USART2_UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+ * @brief UART MSP Initialization
+ * @param uartHandle: UART handle pointer
+ * @retval None
+ */
+void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  if(uartHandle->Instance==USART2)
+  {
+    /* USART2 clock enable */
+    __HAL_RCC_USART2_CLK_ENABLE();
+    
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    /**USART2 GPIO Configuration    
+    PA2     ------> USART2_TX
+    PA3     ------> USART2_RX 
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_3;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
   }
 }
 
