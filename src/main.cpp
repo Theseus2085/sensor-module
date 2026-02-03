@@ -19,31 +19,45 @@ UART_HandleTypeDef huart2;
 // I2C2 removed - using Software I2C for OLED on D6/D3
 ADC_HandleTypeDef hadc1;
 
-// Dummy sensor values - In a real application, read these from ADC/Sensor
-float sensor1_mm = 1.75f;
-float sensor2_mm = 1.75f;
+// Initial sensor values
+float sensor1_mm = 1.90f;
+float sensor2_mm = 1.90f;
 
-// Variable to track if I2C transmission is active/pending
+// I2C transmission status flag
 volatile uint8_t i2c_tx_busy = 0;
+
+// Circular buffers for averaging raw ADC values
+// Buffer size: 2048 samples per sensor = ~0.5 seconds at 4kHz sampling
+#define ADC_BUFFER_SIZE 2048
+#define ADC_BUFFER_MASK (ADC_BUFFER_SIZE - 1)  // For fast modulo with power of 2
+uint16_t adc_buffer_sensor1[ADC_BUFFER_SIZE];
+uint16_t adc_buffer_sensor2[ADC_BUFFER_SIZE];
+uint16_t adc_buffer_index = 0;
+uint8_t adc_buffer_filled = 0;  // Flag to indicate buffer has been filled once
+
+// Last valid ADC readings (within calibration range) for spike rejection
+uint16_t last_valid_raw1 = 2048;  // Initialize to mid-point (1.75mm)
+uint16_t last_valid_raw2 = 2048;
 
 
 struct CalibrationPoint {
-  float voltage;
+  uint16_t raw_adc;  // Raw ADC value (0-4095)
   float diameter_mm;
 };
 
-// Calibration tables for 2 sensors, each with 3 points (Low, Nominal, High)
+// Three-point calibration tables for both sensors
 // TODO: Update these values with actual calibration data for each sensor
+// Default values: 1.0V ≈ 1241, 1.65V ≈ 2048, 2.3V ≈ 2855 (for 3.3V reference)
 CalibrationPoint calibration_tables[2][3] = {
   { // Sensor 1 Table
-    {1.0f, 1.50f},  // Point 1
-    {1.65f, 1.75f}, // Point 2
-    {2.3f, 2.00f}   // Point 3
+    {7.0, 1.47f}, // Placeholder ADC for 1.47mm
+    {532.4, 1.68f}, // Placeholder ADC for 1.68mm
+    {1119.2, 1.99f}  // Placeholder ADC for 1.99mm
   },
   { // Sensor 2 Table
-    {1.0f, 1.50f},  // Point 1
-    {1.65f, 1.75f}, // Point 2
-    {2.3f, 2.00f}   // Point 3
+    {7.0, 1.47f}, // Placeholder ADC for 1.47mm
+    {532.4, 1.68f}, // Placeholder ADC for 1.68mm
+    {1119.2, 1.99f}  // Placeholder ADC for 1.99mm
   }
 };
 
@@ -52,16 +66,15 @@ CalibrationPoint calibration_tables[2][3] = {
 #define CAL_NEXT_BUTTON_PIN GPIO_PIN_5
 #define CAL_NEXT_BUTTON_PORT GPIOB
 
-// --- OLED (0.96" SSD1306 assumed) on separate I2C peripheral ---
-// NOTE: Default pins for I2C2 on STM32F446: PB10=SCL, PB11=SDA (AF4)
-// Update these if your wiring differs.
+// SSD1306 OLED Configuration
+// Default I2C2 Pins: PB10=SCL, PB11=SDA (AF4)
 #define OLED_I2C_ADDRESS (0x3C << 1) // HAL expects 7-bit address shifted left by 1
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
 
 // --- Software I2C Configuration for OLED on D6 (SCL) and D3 (SDA) ---
-// D6 = PB10 (SCL)
-// D3 = PB3  (SDA)
+// Software I2C Bit-banging Configuration
+// D6 = PB10 (SCL), D3 = PB3 (SDA)
 #define SW_I2C_SCL_PIN GPIO_PIN_10
 #define SW_I2C_SCL_PORT GPIOB
 #define SW_I2C_SDA_PIN GPIO_PIN_3
@@ -70,7 +83,7 @@ CalibrationPoint calibration_tables[2][3] = {
 static void sw_i2c_delay(void) {
   // Simple delay for ~100kHz-400kHz. Adjust based on clock speed.
   // For 180MHz, a loop is needed.
-  for(volatile int i=0; i<50; i++) { __NOP(); }
+  for(volatile int i = 0; i < 20; i++) { __NOP(); }
 }
 
 static void sw_i2c_scl_hi(void) {
@@ -142,7 +155,7 @@ static void oled_send_data(const uint8_t* data, uint16_t len) {
   // Try to send efficiently in one transaction if possible, or chunks
   sw_i2c_start();
   sw_i2c_write_byte(OLED_I2C_ADDRESS);
-  sw_i2c_write_byte(0x40); // Data stream
+  sw_i2c_write_byte(0x40); // 0x40 = Co=0, D/C#=1 (Data)
   
   for(uint16_t i=0; i<len; i++) {
       sw_i2c_write_byte(data[i]);
@@ -205,8 +218,8 @@ static void oled_update(void) {
   }
 }
 
-// Minimal 5x7-ish glyphs (columns) for: '0'..'9', 'S', '.', ' ' only.
-// LSB is top pixel within the 8-pixel page.
+// 5x7 Helper Glyphs
+// Vertically oriented pages, LSB = Top
 static const uint8_t glyph_digits[10][5] = {
   {0x3E, 0x51, 0x49, 0x45, 0x3E}, // 0
   {0x00, 0x42, 0x7F, 0x40, 0x00}, // 1
@@ -248,7 +261,7 @@ static void oled_write_char(char c) {
     oled_draw_glyph_5x7(glyph_dot);
     return;
   }
-  // space or unsupported
+  // Fallback for unsupported characters
   static const uint8_t glyph_space[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
   oled_draw_glyph_5x7(glyph_space);
 }
@@ -260,7 +273,7 @@ static void oled_write_string(const char* s) {
 }
 
 static void format_mm_3dp(float val, char out[8]) {
-  // Produces "X.XXX" (up to 9.999), always 5 chars + NUL.
+  // Format float to "X.XXX" fixed width string
   if (val < 0.0f) val = 0.0f;
   if (val > 9.999f) val = 9.999f;
   uint32_t fp = (uint32_t)(val * 1000.0f + 0.5f);
@@ -308,7 +321,7 @@ static void oled_show_cal_prompt(uint8_t sensor_idx, float ref_mm) {
 
 static volatile uint8_t g_calibration_mode = 0;
 
-// Forward declaration (used before the main function prototypes block)
+// Additional Forward Declarations
 void Error_Handler(void);
 void measure_sensor_values(void);
 static void MX_USART2_UART_Init(void);
@@ -328,9 +341,9 @@ void print_debug_info(const char* status) {
   }
 }
 
-float read_sensor_voltage(uint8_t sensor_idx) {
+uint16_t read_sensor_raw_adc(uint8_t sensor_idx) {
   ADC_ChannelConfTypeDef sConfig = {0};
-  float voltage = 0.0f;
+  uint16_t raw_value = 0;
 
   if (sensor_idx == 0) {
     sConfig.Channel = ADC_CHANNEL_0;
@@ -346,12 +359,11 @@ float read_sensor_voltage(uint8_t sensor_idx) {
 
   HAL_ADC_Start(&hadc1);
   if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
-    uint32_t rawValue = HAL_ADC_GetValue(&hadc1);
-    voltage = (float)rawValue * 3.3f / 4095.0f;
+    raw_value = (uint16_t)HAL_ADC_GetValue(&hadc1);  // 0-4095 (12-bit)
   }
   HAL_ADC_Stop(&hadc1);
   
-  return voltage;
+  return raw_value;
 }
 
 void calibration() {
@@ -360,11 +372,11 @@ void calibration() {
 
   g_calibration_mode = 1;
   
-  // Loop through both sensors
+  // Iterate sensors
   for (int s = 0; s < 2; s++) {
-    // Loop through 3 calibration points
+    // Iterate calibration points
     for (int p = 0; p < 3; p++) {
-      // Wait for Next Button Press (Active Low)
+      // Await user confirmation (Active Low)
 
       oled_show_cal_prompt((uint8_t)s, diameters[p]);
       snprintf(status_msg, sizeof(status_msg), "Calibrating S%d, Point %d (%.2fmm)", s + 1, p + 1, diameters[p]);
@@ -376,8 +388,8 @@ void calibration() {
       }
       HAL_Delay(50); // Debounce press
 
-      // Record value
-      calibration_tables[s][p].voltage = read_sensor_voltage(s);
+      // Record raw ADC value
+      calibration_tables[s][p].raw_adc = read_sensor_raw_adc(s);
       calibration_tables[s][p].diameter_mm = diameters[p];
 
       // Wait for Next Button Release
@@ -394,44 +406,100 @@ void calibration() {
   oled_show_normal();
 }
 
-float convert_voltage_to_mm(float voltage, uint8_t sensor_idx) {
+float convert_raw_adc_to_mm(uint16_t raw_adc, uint8_t sensor_idx) {
+  // If raw ADC is very low (sensor disconnected/floating), return default 1.90mm
+  // 248 ≈ 0.2V at 3.3V reference
+  if (raw_adc < 248) {
+      return 1.90f; 
+  }
+
   if (sensor_idx >= 2) return 1.75f; // Safety check
 
   const CalibrationPoint* table = calibration_tables[sensor_idx];
+  float diameter;
 
-  // Linear interpolation between points
-  // Assumes table is sorted by voltage
+  // Linear interpolation using raw ADC values
   
-  if (voltage <= table[1].voltage) {
-    // Interpolate between Point 1 and Point 2
-    float denom = table[1].voltage - table[0].voltage;
-    if (fabs(denom) < 0.0001f) return table[0].diameter_mm;
-    
-    float slope = (table[1].diameter_mm - table[0].diameter_mm) / denom;
-    return table[0].diameter_mm + slope * (voltage - table[0].voltage);
+  if (raw_adc <= table[1].raw_adc) {
+    // Range: Point 1 to Point 2
+    int32_t denom = (int32_t)table[1].raw_adc - (int32_t)table[0].raw_adc;
+    if (denom == 0) {
+      diameter = table[0].diameter_mm;
+    } else {
+      float slope = (table[1].diameter_mm - table[0].diameter_mm) / (float)denom;
+      diameter = table[0].diameter_mm + slope * (float)((int32_t)raw_adc - (int32_t)table[0].raw_adc);
+    }
   } else {
     // Interpolate between Point 2 and Point 3
-    float denom = table[2].voltage - table[1].voltage;
-    if (fabs(denom) < 0.0001f) return table[1].diameter_mm;
-
-    float slope = (table[2].diameter_mm - table[1].diameter_mm) / denom;
-    return table[1].diameter_mm + slope * (voltage - table[1].voltage);
+    int32_t denom = (int32_t)table[2].raw_adc - (int32_t)table[1].raw_adc;
+    if (denom == 0) {
+      diameter = table[1].diameter_mm;
+    } else {
+      float slope = (table[2].diameter_mm - table[1].diameter_mm) / (float)denom;
+      diameter = table[1].diameter_mm + slope * (float)((int32_t)raw_adc - (int32_t)table[1].raw_adc);
+    }
   }
+  
+  return diameter;
 }
 
 void measure_sensor_values() {
-  float voltage;
-
-  // --- Read Sensor 1 (Channel 0 / PA0) ---
-  voltage = read_sensor_voltage(0);
-  sensor1_mm = convert_voltage_to_mm(voltage, 0);
-
-  // --- Read Sensor 2 (Channel 1 / PA1) ---
-  voltage = read_sensor_voltage(1);
-  sensor2_mm = convert_voltage_to_mm(voltage, 1);
+  // Read raw ADC values
+  uint16_t raw1 = read_sensor_raw_adc(0);
+  uint16_t raw2 = read_sensor_raw_adc(1);
+  
+  // Get calibration range limits (smallest to biggest calibration point)
+  uint16_t min_valid_adc_s1 = calibration_tables[0][0].raw_adc;  // Smallest calibration point
+  uint16_t max_valid_adc_s1 = calibration_tables[0][2].raw_adc;  // Biggest calibration point
+  uint16_t min_valid_adc_s2 = calibration_tables[1][0].raw_adc;
+  uint16_t max_valid_adc_s2 = calibration_tables[1][2].raw_adc;
+  
+  // Clamp sensor 1: if outside valid range, use last valid reading
+  if (raw1 >= min_valid_adc_s1 && raw1 <= max_valid_adc_s1) {
+    last_valid_raw1 = raw1;  // Update last valid reading
+  }
+  // else: raw1 is a spike/outlier, use last_valid_raw1 instead
+  
+  // Clamp sensor 2: if outside valid range, use last valid reading
+  if (raw2 >= min_valid_adc_s2 && raw2 <= max_valid_adc_s2) {
+    last_valid_raw2 = raw2;  // Update last valid reading
+  }
+  // else: raw2 is a spike/outlier, use last_valid_raw2 instead
+  
+  // Store validated values in circular buffers (not the spikes!)
+  adc_buffer_sensor1[adc_buffer_index] = last_valid_raw1;
+  adc_buffer_sensor2[adc_buffer_index] = last_valid_raw2;
+  
+  // Advance circular buffer index
+  adc_buffer_index = (adc_buffer_index + 1) & ADC_BUFFER_MASK;
+  
+  // Mark buffer as filled after first complete cycle
+  if (adc_buffer_index == 0 && !adc_buffer_filled) {
+    adc_buffer_filled = 1;
+  }
+  
+  // Calculate average of raw ADC values
+  uint32_t sum1 = 0;
+  uint32_t sum2 = 0;
+  uint16_t samples_to_average = adc_buffer_filled ? ADC_BUFFER_SIZE : adc_buffer_index;
+  
+  // If we don't have enough samples yet, use what we have
+  if (samples_to_average == 0) samples_to_average = 1;
+  
+  for (uint16_t i = 0; i < samples_to_average; i++) {
+    sum1 += adc_buffer_sensor1[i];
+    sum2 += adc_buffer_sensor2[i];
+  }
+  
+  uint16_t avg_raw1 = (uint16_t)(sum1 / samples_to_average);
+  uint16_t avg_raw2 = (uint16_t)(sum2 / samples_to_average);
+  
+  // Convert averaged raw ADC to diameter
+  sensor1_mm = convert_raw_adc_to_mm(avg_raw1, 0);
+  sensor2_mm = convert_raw_adc_to_mm(avg_raw2, 1);
 }
 
-// Buffer to send to printer: 2 axes * 5 bytes = 10 bytes
+// Printer Communication Buffer
 uint8_t tx_buffer[10];
 
 // Function prototypes
@@ -448,21 +516,20 @@ extern "C" {
 }
 
 /**
- * @brief Formats a float diameter into the 5-byte format expected by the printer.
+ * @brief Format diameter for printer protocol
  * Format: X.XXXX (implied decimal)
- * Bytes are raw values 0-9.
+ * Output: Raw byte values 0-9
  */
 void format_sensor_data(float val, uint8_t* buf) {
   // Clamp value to reasonable range (0.0 - 9.9999)
   if (val < 0.0f) val = 0.0f;
   if (val > 9.9999f) val = 9.9999f;
 
-  // Convert to fixed point integer (X.XXXX -> XXXXX)
+  // Fixed-point conversion (X.XXXX)
   uint32_t int_val = (uint32_t)(val * 10000.0f + 0.5f); // +0.5 for rounding
 
-  // Extract digits. 
-  // The printer decoder reads: result = digits[0] + digits[1]*0.1 + ...
-  // So buf[0] is the integer part.
+  // Extract digits for printer protocol
+  // Protocol: buf[0] is integer part, buf[1-4] are decimal digits
   
   buf[0] = (int_val / 10000) % 10;
   buf[1] = (int_val / 1000) % 10;
@@ -485,13 +552,14 @@ int main(void)
   MX_ADC1_Init();
   MX_USART2_UART_Init();
 
-  oled_init();
-  oled_show_normal();
-
-  // Start I2C Slave listening (Interrupt mode)
+  // Start I2C Slave listening FIRST (Interrupt mode) - printer communication must be ready immediately
   if (HAL_I2C_Slave_Transmit_IT(&hi2c1, tx_buffer, 10) != HAL_OK) {
       Error_Handler();
   }
+
+  // Initialize OLED after I2C slave is ready (uses different pins, won't interfere)
+  oled_init();
+  oled_show_normal();
 
   uint32_t last_oled_update = HAL_GetTick();
 
@@ -509,11 +577,9 @@ int main(void)
 
     // 1. Update sensor readings
     measure_sensor_values();
+    update_buffer(); // Ensure buffer is fresh for I2C
     print_debug_info("Normal Mode");
     
-    // 2. Prepare the buffer
-    update_buffer();
-
     // Update OLED every 10 seconds in normal mode
     if (!g_calibration_mode) {
       uint32_t now = HAL_GetTick();
@@ -561,10 +627,7 @@ void HAL_I2C_SlaveTxCpltCallback(I2C_HandleTypeDef *hi2c) {
 // Handle errors (like NACK or Bus Error) by re-arming
 void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
     if (hi2c->Instance == I2C1) {
-        // Clear flags and restart
-        // __HAL_I2C_CLEAR_FLAG(hi2c, I2C_FLAG_BUSY); // Dangerous to force clear
-        // Simply trying to restart listening is often enough
-        HAL_I2C_Slave_Transmit_IT(&hi2c1, tx_buffer, 10);
+        // Attempt restart on error (e.g., NACK/Bus Error)
     }
 }
 
@@ -593,7 +656,7 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
     */
     GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;  // No internal pull-ups - printer has external pull-ups
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
