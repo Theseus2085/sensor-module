@@ -12,7 +12,18 @@
  * TODO: Set this address to match FILWIDTH_SENSOR_I2C_ADDRESS in your Marlin configuration.
  * Note: HAL expects the address shifted left by 1.
  */
-#define SENSOR_I2C_ADDRESS 0x42 
+#define SENSOR_I2C_ADDRESS 0x42
+
+// Test Mode Configuration
+// Set to 1 to output fictional test values instead of real sensor readings
+// Set to 0 for normal operation with real sensors
+#define TEST_MODE 1
+
+#if TEST_MODE
+  // Fictional test diameter values (in mm) for printer communication testing
+  #define TEST_SENSOR1_MM 1.90f
+  #define TEST_SENSOR2_MM 1.90f
+#endif 
 
 I2C_HandleTypeDef hi2c1;
 UART_HandleTypeDef huart2;
@@ -20,8 +31,8 @@ UART_HandleTypeDef huart2;
 ADC_HandleTypeDef hadc1;
 
 // Initial sensor values
-float sensor1_mm = 1.90f;
-float sensor2_mm = 1.90f;
+float sensor1_mm = 1.75f;
+float sensor2_mm = 1.75f;
 
 // I2C transmission status flag
 volatile uint8_t i2c_tx_busy = 0;
@@ -36,8 +47,8 @@ uint16_t adc_buffer_index = 0;
 uint8_t adc_buffer_filled = 0;  // Flag to indicate buffer has been filled once
 
 // Last valid ADC readings (within calibration range) for spike rejection
-uint16_t last_valid_raw1 = 2048;  // Initialize to mid-point (1.75mm)
-uint16_t last_valid_raw2 = 2048;
+uint16_t last_valid_raw1 = 7;  // Initialize to mid-point (1.75mm)
+uint16_t last_valid_raw2 = 7;
 
 
 struct CalibrationPoint {
@@ -50,14 +61,14 @@ struct CalibrationPoint {
 // Default values: 1.0V ≈ 1241, 1.65V ≈ 2048, 2.3V ≈ 2855 (for 3.3V reference)
 CalibrationPoint calibration_tables[2][3] = {
   { // Sensor 1 Table
-    {7.0, 1.47f}, // Placeholder ADC for 1.47mm
-    {532.4, 1.68f}, // Placeholder ADC for 1.68mm
-    {1119.2, 1.99f}  // Placeholder ADC for 1.99mm
+    {7, 1.47f}, // Placeholder ADC for 1.47mm
+    {532, 1.68f}, // Placeholder ADC for 1.68mm
+    {1119, 1.99f}  // Placeholder ADC for 1.99mm
   },
   { // Sensor 2 Table
-    {7.0, 1.47f}, // Placeholder ADC for 1.47mm
-    {532.4, 1.68f}, // Placeholder ADC for 1.68mm
-    {1119.2, 1.99f}  // Placeholder ADC for 1.99mm
+    {7, 1.47f}, // Placeholder ADC for 1.47mm
+    {532, 1.68f}, // Placeholder ADC for 1.68mm
+    {1119, 1.99f}  // Placeholder ADC for 1.99mm
   }
 };
 
@@ -539,8 +550,15 @@ void format_sensor_data(float val, uint8_t* buf) {
 }
 
 void update_buffer() {
+#if TEST_MODE
+  // Test mode: Use fictional values for printer communication testing
+  format_sensor_data(TEST_SENSOR1_MM, &tx_buffer[0]);
+  format_sensor_data(TEST_SENSOR2_MM, &tx_buffer[5]);
+#else
+  // Normal mode: Use real sensor measurements
   format_sensor_data(sensor1_mm, &tx_buffer[0]);
   format_sensor_data(sensor2_mm, &tx_buffer[5]);
+#endif
 }
 
 int main(void)
