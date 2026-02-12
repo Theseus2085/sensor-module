@@ -1,0 +1,645 @@
+/**
+ * @file main.cpp
+ * @brief STM32F446RE main application file using STM32Cube HAL
+ */
+
+#include "stm32f4xx_hal.h"
+#include <string.h>
+#include <math.h>
+#include <stdio.h>
+
+/* 
+ * TODO: Set this address to match FILWIDTH_SENSOR_I2C_ADDRESS in your Marlin configuration.
+ * Note: HAL expects the address shifted left by 1.
+ */
+#define SENSOR_I2C_ADDRESS 0x42
+
+// Test Mode Configuration
+// Set to 1 to output fictional test values instead of real sensor readings
+// Set to 0 for normal operation with real sensors
+#define TEST_MODE 1
+
+#if TEST_MODE
+  // Fictional test diameter values (in mm) for printer communication testing
+  #define TEST_SENSOR1_MM 1.99f
+  #define TEST_SENSOR2_MM 1.99f
+#endif 
+
+I2C_HandleTypeDef hi2c1;
+UART_HandleTypeDef huart2;
+ADC_HandleTypeDef hadc1;
+
+// Flag to indicate UART is ready for logging (set after MX_USART2_UART_Init)
+volatile uint8_t uart_ready = 0;
+
+// Helper macro for safe UART logging
+#define UART_LOG(msg, len) if(uart_ready) HAL_UART_Transmit(&huart2, (uint8_t*)(msg), (len), 100)
+
+// Initial sensor values
+float sensor1_mm = 1.75f;
+float sensor2_mm = 1.75f;
+
+// I2C transmission status flag
+volatile uint8_t i2c_tx_busy = 0;
+
+// Circular buffers for averaging raw ADC values
+// Buffer size: 2048 samples per sensor = ~0.5 seconds at 4kHz sampling
+#define ADC_BUFFER_SIZE 2048
+#define ADC_BUFFER_MASK (ADC_BUFFER_SIZE - 1)  // For fast modulo with power of 2
+uint16_t adc_buffer_sensor1[ADC_BUFFER_SIZE];
+uint16_t adc_buffer_sensor2[ADC_BUFFER_SIZE];
+uint16_t adc_buffer_index = 0;
+uint8_t adc_buffer_filled = 0;  // Flag to indicate buffer has been filled once
+
+// Last valid ADC readings (within calibration range) for spike rejection
+uint16_t last_valid_raw1 = 7;  // Initialize to mid-point (1.75mm)
+uint16_t last_valid_raw2 = 7;
+
+
+struct CalibrationPoint {
+  uint16_t raw_adc;  // Raw ADC value (0-4095)
+  float diameter_mm;
+};
+
+// Three-point calibration tables for both sensors
+// TODO: Update these values with actual calibration data for each sensor
+// Default values: 1.0V ≈ 1241, 1.65V ≈ 2048, 2.3V ≈ 2855 (for 3.3V reference)
+CalibrationPoint calibration_tables[2][3] = {
+  { // Sensor 1 Table
+    {7, 1.47f}, // Placeholder ADC for 1.47mm
+    {532, 1.68f}, // Placeholder ADC for 1.68mm
+    {1119, 1.99f}  // Placeholder ADC for 1.99mm
+  },
+  { // Sensor 2 Table
+    {7, 1.47f}, // Placeholder ADC for 1.47mm
+    {532, 1.68f}, // Placeholder ADC for 1.68mm
+    {1119, 1.99f}  // Placeholder ADC for 1.99mm
+  }
+};
+
+#define CAL_START_BUTTON_PIN GPIO_PIN_4
+#define CAL_START_BUTTON_PORT GPIOB
+#define CAL_NEXT_BUTTON_PIN GPIO_PIN_5
+#define CAL_NEXT_BUTTON_PORT GPIOB
+
+// Additional Forward Declarations
+void Error_Handler(void);
+void measure_sensor_values(void);
+static void MX_USART2_UART_Init(void);
+
+static uint32_t last_serial_print = 0;
+
+void print_debug_info(const char* status) {
+  uint32_t now = HAL_GetTick();
+  if (now - last_serial_print >= 5000) {
+    char msg[128];
+    int len = snprintf(msg, sizeof(msg), "S1: %.3fmm, S2: %.3fmm, Status: %s\r\n", 
+                       sensor1_mm, sensor2_mm, status);
+    if (len > 0) {
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 100);
+    }
+    last_serial_print = now;
+  }
+}
+
+uint16_t read_sensor_raw_adc(uint8_t sensor_idx) {
+  ADC_ChannelConfTypeDef sConfig = {0};
+  uint16_t raw_value = 0;
+
+  if (sensor_idx == 0) {
+    sConfig.Channel = ADC_CHANNEL_0;
+  } else {
+    sConfig.Channel = ADC_CHANNEL_1;
+  }
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+  
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+    Error_Handler();
+  }
+
+  HAL_ADC_Start(&hadc1);
+  if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+    raw_value = (uint16_t)HAL_ADC_GetValue(&hadc1);  // 0-4095 (12-bit)
+  }
+  HAL_ADC_Stop(&hadc1);
+  
+  return raw_value;
+}
+
+void calibration() {
+  char msg[] = "Calibration Started\r\n";
+  UART_LOG(msg, sizeof(msg)-1);
+  float diameters[] = {1.50f, 1.75f, 2.00f};
+  char status_msg[64];
+
+  g_calibration_mode = 1;
+  
+  // Iterate sensors
+  for (int s = 0; s < 2; s++) {
+    // Iterate calibration points
+    for (int p = 0; p < 3; p++) {
+      // Await user confirmation (Active Low)
+      snprintf(status_msg, sizeof(status_msg), "Calibrating S%d, Point %d (%.2fmm)", s + 1, p + 1, diameters[p]);
+
+      while(HAL_GPIO_ReadPin(CAL_NEXT_BUTTON_PORT, CAL_NEXT_BUTTON_PIN) == GPIO_PIN_SET) {
+        HAL_Delay(10);
+        measure_sensor_values();
+        print_debug_info(status_msg);
+      }
+      HAL_Delay(50); // Debounce press
+
+      // Record raw ADC value
+      calibration_tables[s][p].raw_adc = read_sensor_raw_adc(s);
+      calibration_tables[s][p].diameter_mm = diameters[p];
+
+      // Wait for Next Button Release
+      while(HAL_GPIO_ReadPin(CAL_NEXT_BUTTON_PORT, CAL_NEXT_BUTTON_PIN) == GPIO_PIN_RESET) {
+        HAL_Delay(10);
+        measure_sensor_values();
+        print_debug_info(status_msg);
+      }
+      HAL_Delay(50); // Debounce release
+    }
+  }
+}
+
+float convert_raw_adc_to_mm(uint16_t raw_adc, uint8_t sensor_idx) {
+  // If raw ADC is very low (sensor disconnected/floating), return default 1.90mm
+  // 248 ≈ 0.2V at 3.3V reference
+  if (raw_adc < 248) {
+      return 1.90f; 
+  }
+
+  if (sensor_idx >= 2) return 1.75f; // Safety check
+
+  const CalibrationPoint* table = calibration_tables[sensor_idx];
+  float diameter;
+
+  // Linear interpolation using raw ADC values
+  
+  if (raw_adc <= table[1].raw_adc) {
+    // Range: Point 1 to Point 2
+    int32_t denom = (int32_t)table[1].raw_adc - (int32_t)table[0].raw_adc;
+    if (denom == 0) {
+      diameter = table[0].diameter_mm;
+    } else {
+      float slope = (table[1].diameter_mm - table[0].diameter_mm) / (float)denom;
+      diameter = table[0].diameter_mm + slope * (float)((int32_t)raw_adc - (int32_t)table[0].raw_adc);
+    }
+  } else {
+    // Interpolate between Point 2 and Point 3
+    int32_t denom = (int32_t)table[2].raw_adc - (int32_t)table[1].raw_adc;
+    if (denom == 0) {
+      diameter = table[1].diameter_mm;
+    } else {
+      float slope = (table[2].diameter_mm - table[1].diameter_mm) / (float)denom;
+      diameter = table[1].diameter_mm + slope * (float)((int32_t)raw_adc - (int32_t)table[1].raw_adc);
+    }
+  }
+  
+  return diameter;
+}
+
+void measure_sensor_values() {
+  // Read raw ADC values
+  uint16_t raw1 = read_sensor_raw_adc(0);
+  uint16_t raw2 = read_sensor_raw_adc(1);
+  
+  // Get calibration range limits (smallest to biggest calibration point)
+  uint16_t min_valid_adc_s1 = calibration_tables[0][0].raw_adc;  // Smallest calibration point
+  uint16_t max_valid_adc_s1 = calibration_tables[0][2].raw_adc;  // Biggest calibration point
+  uint16_t min_valid_adc_s2 = calibration_tables[1][0].raw_adc;
+  uint16_t max_valid_adc_s2 = calibration_tables[1][2].raw_adc;
+  
+  // Clamp sensor 1: if outside valid range, use last valid reading
+  if (raw1 >= min_valid_adc_s1 && raw1 <= max_valid_adc_s1) {
+    last_valid_raw1 = raw1;  // Update last valid reading
+  }
+  // else: raw1 is a spike/outlier, use last_valid_raw1 instead
+  
+  // Clamp sensor 2: if outside valid range, use last valid reading
+  if (raw2 >= min_valid_adc_s2 && raw2 <= max_valid_adc_s2) {
+    last_valid_raw2 = raw2;  // Update last valid reading
+  }
+  // else: raw2 is a spike/outlier, use last_valid_raw2 instead
+  
+  // Store validated values in circular buffers (not the spikes!)
+  adc_buffer_sensor1[adc_buffer_index] = last_valid_raw1;
+  adc_buffer_sensor2[adc_buffer_index] = last_valid_raw2;
+  
+  // Advance circular buffer index
+  adc_buffer_index = (adc_buffer_index + 1) & ADC_BUFFER_MASK;
+  
+  // Mark buffer as filled after first complete cycle
+  if (adc_buffer_index == 0 && !adc_buffer_filled) {
+    adc_buffer_filled = 1;
+  }
+  
+  // Calculate average of raw ADC values
+  uint32_t sum1 = 0;
+  uint32_t sum2 = 0;
+  uint16_t samples_to_average = adc_buffer_filled ? ADC_BUFFER_SIZE : adc_buffer_index;
+  
+  // If we don't have enough samples yet, use what we have
+  if (samples_to_average == 0) samples_to_average = 1;
+  
+  for (uint16_t i = 0; i < samples_to_average; i++) {
+    sum1 += adc_buffer_sensor1[i];
+    sum2 += adc_buffer_sensor2[i];
+  }
+  
+  uint16_t avg_raw1 = (uint16_t)(sum1 / samples_to_average);
+  uint16_t avg_raw2 = (uint16_t)(sum2 / samples_to_average);
+  
+  // Convert averaged raw ADC to diameter
+  sensor1_mm = convert_raw_adc_to_mm(avg_raw1, 0);
+  sensor2_mm = convert_raw_adc_to_mm(avg_raw2, 1);
+}
+
+// Printer Communication Buffer
+uint8_t tx_buffer[10];
+
+// Function prototypes
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_ADC1_Init(void);
+void Error_Handler(void);
+
+// I2C Interrupt Handlers
+extern "C" {
+  void I2C1_EV_IRQHandler(void);
+  void I2C1_ER_IRQHandler(void);
+}
+
+/**
+ * @brief Format diameter for printer protocol
+ * Format: X.XXXX (implied decimal)
+ * Output: Raw byte values 0-9
+ */
+void format_sensor_data(float val, uint8_t* buf) {
+  // Clamp value to reasonable range (0.0 - 9.9999)
+  if (val < 0.0f) val = 0.0f;
+  if (val > 9.9999f) val = 9.9999f;
+
+  // Fixed-point conversion (X.XXXX)
+  uint32_t int_val = (uint32_t)(val * 10000.0f + 0.5f); // +0.5 for rounding
+
+  // Extract digits for printer protocol
+  // Protocol: buf[0] is integer part, buf[1-4] are decimal digits
+  
+  buf[0] = (int_val / 10000) % 10;
+  buf[1] = (int_val / 1000) % 10;
+  buf[2] = (int_val / 100) % 10;
+  buf[3] = (int_val / 10) % 10;
+  buf[4] = (int_val / 1) % 10;
+}
+
+void update_buffer() {
+#if TEST_MODE
+  // Test mode: Use fictional values for printer communication testing
+  format_sensor_data(TEST_SENSOR1_MM, &tx_buffer[0]);
+  format_sensor_data(TEST_SENSOR2_MM, &tx_buffer[5]);
+#else
+  // Normal mode: Use real sensor measurements
+  format_sensor_data(sensor1_mm, &tx_buffer[0]);
+  format_sensor_data(sensor2_mm, &tx_buffer[5]);
+#endif
+}
+
+// Simple delay function
+void delay_ms(uint32_t ms) {
+  for(volatile uint32_t i = 0; i < ms * 4000; i++);
+}
+
+void uart_send_char(char c) {
+  while(!(USART2->SR & (1 << 7)));  // Wait for TXE
+  USART2->DR = c;
+}
+
+void uart_send_string(const char* str) {
+  while(*str) {
+    uart_send_char(*str++);
+  }
+}
+
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_ADC1_Init();
+  MX_USART2_UART_Init();
+
+  // UART is now ready - enable logging to the Arduino bridge on PA2/PA3
+  uart_ready = 1;
+  const char msg[] = "\r\nBridge UART ready @115200\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t*)msg, sizeof(msg)-1, 100);
+
+  // Start I2C Slave listening FIRST (Interrupt mode) - printer communication must be ready immediately
+  if (HAL_I2C_Slave_Transmit_IT(&hi2c1, tx_buffer, 10) != HAL_OK) {
+      Error_Handler();
+  }
+
+  while (1)
+  {
+    // Check for Calibration Start Button (Active Low)
+    if (HAL_GPIO_ReadPin(CAL_START_BUTTON_PORT, CAL_START_BUTTON_PIN) == GPIO_PIN_RESET) {
+      // Debounce
+      HAL_Delay(50);
+      if (HAL_GPIO_ReadPin(CAL_START_BUTTON_PORT, CAL_START_BUTTON_PIN) == GPIO_PIN_RESET) {
+        calibration();
+      }
+    }
+
+    // 1. Update sensor readings
+    measure_sensor_values();
+    update_buffer(); // Ensure buffer is fresh for I2C
+    print_debug_info("Normal Mode");
+  }
+}
+
+/**
+ * @brief I2C1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_I2C1_Init(void)
+{
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  
+  // Enable Interrupts
+  HAL_NVIC_SetPriority(I2C1_EV_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);
+  HAL_NVIC_SetPriority(I2C1_ER_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(I2C1_ER_IRQn);
+}
+
+// Re-arm the I2C Slave TX after completion
+void HAL_I2C_SlaveTxCpltCallback(I2C_HandleTypeDef *hi2c) {
+    if (hi2c->Instance == I2C1) {
+        // Print I2C data transmitted and sensor values
+        char msg[128];
+        int len = snprintf(msg, sizeof(msg), "I2C TX: [%d %d %d %d %d | %d %d %d %d %d] S1=%.3fmm S2=%.3fmm\r\n", 
+                           tx_buffer[0], tx_buffer[1], tx_buffer[2], tx_buffer[3], tx_buffer[4],
+                           tx_buffer[5], tx_buffer[6], tx_buffer[7], tx_buffer[8], tx_buffer[9],
+                           sensor1_mm, sensor2_mm);
+        if (len > 0) {
+            HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 100);
+        }
+        
+        HAL_I2C_Slave_Transmit_IT(&hi2c1, tx_buffer, 10);
+    }
+}
+
+// Handle errors (like NACK or Bus Error) by re-arming
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
+    if (hi2c->Instance == I2C1) {
+        char msg[64];
+        int len = snprintf(msg, sizeof(msg), "I2C Error: 0x%08lX\r\n", hi2c->ErrorCode);
+        if (len > 0) UART_LOG(msg, len);
+        // Attempt restart on error (e.g., NACK/Bus Error)
+    }
+}
+
+// Interrupt Dispatchers
+void I2C1_EV_IRQHandler(void) {
+  HAL_I2C_EV_IRQHandler(&hi2c1);
+}
+
+void I2C1_ER_IRQHandler(void) {
+  HAL_I2C_ER_IRQHandler(&hi2c1);
+}
+
+// Removed MX_I2C2_Init as we use Software I2C on GPIOs
+
+void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  if(i2cHandle->Instance == I2C1) 
+  {
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_I2C1_CLK_ENABLE();
+
+    /**I2C1 GPIO Configuration
+    PB8     ------> I2C1_SCL (Arduino D15)
+    PB9     ------> I2C1_SDA (Arduino D14)
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;  // No internal pull-ups - printer has external pull-ups
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  }
+}
+
+/**
+ * @brief USART2 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_USART2_UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+ * @brief UART MSP Initialization
+ * @param uartHandle: UART handle pointer
+ * @retval None
+ */
+void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  if(uartHandle->Instance==USART2)
+  {
+    /* USART2 clock enable */
+    __HAL_RCC_USART2_CLK_ENABLE();
+    
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    /**USART2 GPIO Configuration    
+    PA2     ------> USART2_TX
+    PA3     ------> USART2_RX 
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_3;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  }
+}
+
+/**
+ * @brief ADC1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_ADC1_Init(void)
+{
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+ * @brief ADC MSP Initialization
+ * This function configures the hardware resources used in this example
+ * @param adcHandle: ADC handle pointer
+ * @retval None
+ */
+void HAL_ADC_MspInit(ADC_HandleTypeDef* adcHandle)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  if(adcHandle->Instance==ADC1)
+  {
+    /* ADC1 clock enable */
+    __HAL_RCC_ADC1_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    /**ADC1 GPIO Configuration
+    PA0     ------> ADC1_IN0
+    PA1     ------> ADC1_IN1
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  }
+}
+
+/**
+ * @brief System Clock Configuration
+ * @retval None
+ */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  // Configure the main internal regulator output voltage
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  // Use HSI at 84MHz (safer, proven configuration for F446RE)
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 16;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  // Configure clocks - 84MHz system clock
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
+void Error_Handler(void)
+{
+  char msg[] = "Error_Handler\r\n";
+  UART_LOG(msg, sizeof(msg)-1);
+  // User can add their own implementation to report the HAL error return state
+  __disable_irq();
+  while (1)
+  {
+    // Stay here in case of error
+  }
+}
+
+/**
+ * @brief GPIO Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pins : PB4 PB5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+ * @brief  Reports the name of the source file and the source line number
+ *         where the assert_param error has occurred.
+ * @param  file: pointer to the source file name
+ * @param  line: assert_param error line source number
+ * @retval None
+ */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  char msg[64];
+  int len = snprintf(msg, sizeof(msg), "assert_failed: %s:%lu\r\n", file, line);
+  if (len > 0) HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 10);
+  // User can add their own implementation to report the file name and line number,
+  // for example: printf("Wrong parameters value: file %s on line %d\r\n", file, line)
+}
+#endif /* USE_FULL_ASSERT */
