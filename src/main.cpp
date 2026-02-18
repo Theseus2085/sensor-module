@@ -7,7 +7,7 @@
  * - STM32F446RE Nucleo Board
  * - 2x Hall Effect Sensors (SS495A) on PA0/PA1 (ADC inputs)
  * - I2C1 Slave on PB8/PB9 for printer communication
- * - USB Serial for debug output at 115200 baud
+ * - USB Serial at 115200 baud
  * - Calibration buttons on PB6/PB7
  * 
  * I2C Connection to Printer:
@@ -21,30 +21,10 @@
 #include "mbed.h"
 
 // ============================================================================
-// FIRMWARE / DEBUG CONFIGURATION
+// FIRMWARE CONFIGURATION
 // ============================================================================
 
-#define FW_VERSION "0.5.1-dbg.addrlog.1"
-
-#ifndef I2C_DEBUG_ENABLE
-  #if defined(NDEBUG)
-    #define I2C_DEBUG_ENABLE 0
-  #else
-    #define I2C_DEBUG_ENABLE 1
-  #endif
-#endif
-
-#ifndef I2C_DEBUG_PRINT_PERIOD_MS
-  #define I2C_DEBUG_PRINT_PERIOD_MS 1000
-#endif
-
-#ifndef I2C_DEBUG_EVENT_QUEUE_LEN
-  #define I2C_DEBUG_EVENT_QUEUE_LEN 64
-#endif
-
-#if I2C_DEBUG_EVENT_QUEUE_LEN < 2
-  #error "I2C_DEBUG_EVENT_QUEUE_LEN must be at least 2"
-#endif
+#define FW_VERSION "0.5.2"
 
 // ============================================================================
 // PIN DEFINITIONS
@@ -67,9 +47,6 @@ I2CSlave i2c_slave(PB_9, PB_8);  // SDA, SCL
 DigitalOut led(PA_5);
 DigitalIn cal_start_btn(PB_6, PullUp);
 DigitalIn cal_next_btn(PB_7, PullUp);
-
-// Serial debug
-BufferedSerial pc(USBTX, USBRX, 115200);
 
 // ============================================================================
 // GLOBAL VARIABLES
@@ -131,41 +108,8 @@ volatile uint8_t tx_buffer[10] = {0};
 volatile uint32_t i2c_request_count = 0;
 volatile uint64_t last_i2c_request_time_us = 0;
 
-enum I2cDebugEventType : uint8_t {
-  EV_READ_ADDRESSED = 1,
-  EV_WRITE_ADDRESSED = 2,
-  EV_WRITE_GENERAL = 3,
-  EV_WRITE_READ_ERROR = 4,
-  EV_SLAVE_REINIT = 5,
-};
-
-struct I2cDebugEvent {
-  uint8_t type;
-};
-
-struct I2cDebugCounters {
-  uint32_t total_events;
-  uint32_t read_addressed;
-  uint32_t write_addressed;
-  uint32_t write_general;
-  uint32_t write_read_error;
-  uint32_t slave_reinit;
-  uint32_t queue_overflow;
-};
-
-#if I2C_DEBUG_ENABLE
-volatile I2cDebugEvent i2c_debug_event_queue[I2C_DEBUG_EVENT_QUEUE_LEN];
-volatile uint16_t i2c_debug_event_head = 0;
-volatile uint16_t i2c_debug_event_tail = 0;
-volatile uint32_t i2c_debug_event_overflow = 0;
-I2cDebugCounters i2c_debug_counters = {};
-#endif
-
 /* Timing */
 Timer heartbeat_timer;
-Timer serial_timer;
-Timer i2c_check_timer;
-Timer i2c_debug_timer;
 Timer uptime_timer;
 
 // ============================================================================
@@ -174,11 +118,6 @@ Timer uptime_timer;
 
 void format_sensor_data(float val, uint8_t* buf);
 void reinit_i2c_slave();
-void enqueue_i2c_debug_event(I2cDebugEventType event_type);
-bool dequeue_i2c_debug_event(I2cDebugEvent &event);
-void consume_i2c_debug_events();
-void print_i2c_debug_info();
-void print_mm_value(const char* label, float value_mm);
 uint64_t get_uptime_us();
 
 // ============================================================================
@@ -326,155 +265,16 @@ void format_sensor_data(float val, uint8_t* buf) {
   buf[4] = (int_val / 1) % 10;
 }
 
-void enqueue_i2c_debug_event(I2cDebugEventType event_type) {
-#if I2C_DEBUG_ENABLE
-  core_util_critical_section_enter();
-
-  const uint16_t next_head = (uint16_t)((i2c_debug_event_head + 1) % I2C_DEBUG_EVENT_QUEUE_LEN);
-  if (next_head == i2c_debug_event_tail) {
-    // Drop newest event if queue is full to preserve non-blocking behavior.
-    i2c_debug_event_overflow++;
-    core_util_critical_section_exit();
-    return;
-  }
-
-  i2c_debug_event_queue[i2c_debug_event_head].type = (uint8_t)event_type;
-  i2c_debug_event_head = next_head;
-
-  core_util_critical_section_exit();
-#else
-  (void)event_type;
-#endif
-}
-
-bool dequeue_i2c_debug_event(I2cDebugEvent &event) {
-#if I2C_DEBUG_ENABLE
-  bool has_data = false;
-
-  core_util_critical_section_enter();
-
-  if (i2c_debug_event_tail != i2c_debug_event_head) {
-    event.type = i2c_debug_event_queue[i2c_debug_event_tail].type;
-    i2c_debug_event_tail = (uint16_t)((i2c_debug_event_tail + 1) % I2C_DEBUG_EVENT_QUEUE_LEN);
-    has_data = true;
-  }
-
-  core_util_critical_section_exit();
-
-  return has_data;
-#else
-  (void)event;
-  return false;
-#endif
-}
-
-void consume_i2c_debug_events() {
-#if I2C_DEBUG_ENABLE
-  I2cDebugEvent event = {};
-
-  while (dequeue_i2c_debug_event(event)) {
-    i2c_debug_counters.total_events++;
-
-    switch ((I2cDebugEventType)event.type) {
-      case EV_READ_ADDRESSED:
-        i2c_debug_counters.read_addressed++;
-        break;
-      case EV_WRITE_ADDRESSED:
-        i2c_debug_counters.write_addressed++;
-        break;
-      case EV_WRITE_GENERAL:
-        i2c_debug_counters.write_general++;
-        break;
-      case EV_WRITE_READ_ERROR:
-        i2c_debug_counters.write_read_error++;
-        break;
-      case EV_SLAVE_REINIT:
-        i2c_debug_counters.slave_reinit++;
-        break;
-      default:
-        break;
-    }
-  }
-
-  i2c_debug_counters.queue_overflow = i2c_debug_event_overflow;
-#endif
-}
-
 uint64_t get_uptime_us() {
+  // Timer::elapsed_time() reports microseconds on mbed chrono durations.
   return (uint64_t)uptime_timer.elapsed_time().count();
-}
-
-void print_mm_value(const char* label, float value_mm) {
-  if (value_mm < 0.0f) value_mm = 0.0f;
-
-  const uint32_t milli = (uint32_t)(value_mm * 1000.0f + 0.5f);
-  printf("%s: %lu.%03lumm", label, (unsigned long)(milli / 1000), (unsigned long)(milli % 1000));
-}
-
-void print_i2c_debug_info() {
-#if I2C_DEBUG_ENABLE
-  if (i2c_debug_timer.elapsed_time() < std::chrono::milliseconds(I2C_DEBUG_PRINT_PERIOD_MS)) {
-    return;
-  }
-
-  i2c_debug_timer.reset();
-
-  printf("I2CDBG own7=0x%02X total=%lu rd=%lu wr=%lu gc=%lu ioerr=%lu reinits=%lu qovf=%lu req=%lu \n",
-         SENSOR_I2C_ADDRESS >> 1,
-         (unsigned long)i2c_debug_counters.total_events,
-         (unsigned long)i2c_debug_counters.read_addressed,
-         (unsigned long)i2c_debug_counters.write_addressed,
-         (unsigned long)i2c_debug_counters.write_general,
-         (unsigned long)i2c_debug_counters.write_read_error,
-         (unsigned long)i2c_debug_counters.slave_reinit,
-         (unsigned long)i2c_debug_counters.queue_overflow,
-         (unsigned long)i2c_request_count);
-#endif
-}
-
-void print_debug_info(const char* status) {
-  if (serial_timer.elapsed_time() >= 5s) {
-    serial_timer.reset();
-    
-    uint64_t now_us = get_uptime_us();
-    bool i2c_active = i2c_request_count > 0 && (now_us - last_i2c_request_time_us) < 5000000ULL;
-    const char* i2c_status = i2c_active ? "ACTIVE" : "IDLE";
-    
-#if TEST_MODE
-    print_mm_value("[TEST MODE] S1", TEST_SENSOR1_MM);
-    printf(" | ");
-    print_mm_value("S2", TEST_SENSOR2_MM);
-#else
-    print_mm_value("S1", sensor1_mm);
-    printf(" | ");
-    print_mm_value("S2", sensor2_mm);
-#endif
-    
-    printf(" | ADC: [%u, %u]", last_valid_raw1, last_valid_raw2);
-    printf(" | I2C: %s (%lu requests) | %s\n", i2c_status, (unsigned long)i2c_request_count, status);
-  }
-}
-
-void check_i2c_connection() {
-  if (i2c_check_timer.elapsed_time() >= 10s) {
-    i2c_check_timer.reset();
-    
-    uint64_t now_us = get_uptime_us();
-    bool i2c_active = i2c_request_count > 0 && (now_us - last_i2c_request_time_us) < 5000000ULL;
-    
-    if (!i2c_active && i2c_request_count == 0) {
-      printf("I2C: Waiting for printer master connection...\n");
-    } else if (!i2c_active && i2c_request_count > 0) {
-      printf("I2C: Master disconnected\n");
-    }
-  }
 }
 
 void reinit_i2c_slave() {
   i2c_slave.stop();
+  // mbed reinitializes the peripheral in frequency(); set address afterwards.
   i2c_slave.frequency(SENSOR_I2C_FREQUENCY_HZ);
   i2c_slave.address(SENSOR_I2C_ADDRESS);
-  enqueue_i2c_debug_event(EV_SLAVE_REINIT);
 }
 
 // ============================================================================
@@ -486,45 +286,35 @@ void i2c_slave_thread() {
     int status = i2c_slave.receive();
 
     if (status == I2CSlave::NoData) {
-      // Small delay avoids starving lower-priority threads when the bus is idle.
+      // Yield CPU while idle without adding latency to addressed transactions.
       ThisThread::sleep_for(1ms);
       continue;
     }
 
     if (status == I2CSlave::WriteGeneral) {
-      enqueue_i2c_debug_event(EV_WRITE_GENERAL);
+      // General-call writes are ignored (best-effort drain for compatibility).
       char dummy;
-      if (i2c_slave.read(&dummy, 1) != 0) {
-        enqueue_i2c_debug_event(EV_WRITE_READ_ERROR);
-        reinit_i2c_slave();
-        continue;
-      }
+      (void)i2c_slave.read(&dummy, 1);
     }
     else if (status == I2CSlave::WriteAddressed) {
-      // Master is sending data (not used in this application)
-      enqueue_i2c_debug_event(EV_WRITE_ADDRESSED);
+      // Host write probes are treated as non-fatal (best-effort drain).
       char dummy;
-      if (i2c_slave.read(&dummy, 1) != 0) {
-        enqueue_i2c_debug_event(EV_WRITE_READ_ERROR);
-        reinit_i2c_slave();
-        continue;
-      }
+      (void)i2c_slave.read(&dummy, 1);
     }
     else if (status == I2CSlave::ReadAddressed) {
-      // Master is requesting data - send the 10-byte buffer immediately
-      enqueue_i2c_debug_event(EV_READ_ADDRESSED);
+      // Primary path: respond with the latest 10-byte diameter payload.
       i2c_request_count++;
       last_i2c_request_time_us = get_uptime_us();
 
-      // Send directly from volatile buffer - it's always ready
+      // Buffer is continuously refreshed by main loop; no copy/allocation here.
       if (i2c_slave.write((const char *)tx_buffer, 10) != 0) {
-        enqueue_i2c_debug_event(EV_WRITE_READ_ERROR);
+        printf("I2C: read-response write failed, reinitializing slave\n");
         reinit_i2c_slave();
         continue;
       }
     }
 
-    // Respond quickly while still allowing other threads to run.
+    // Keep bus service latency low while cooperating with other threads.
     ThisThread::yield();
   }
 }
@@ -557,12 +347,6 @@ int main() {
   printf("I2C: 400kHz Fast Mode\n");
   printf("Address7: 0x%02X\n", SENSOR_I2C_ADDRESS >> 1);
   printf("Address8: 0x%02X\n", SENSOR_I2C_ADDRESS);
-#if I2C_DEBUG_ENABLE
-  printf("I2C debug: ENABLED (period=%dms, queue=%d)\n", (int)I2C_DEBUG_PRINT_PERIOD_MS, (int)I2C_DEBUG_EVENT_QUEUE_LEN);
-#else
-  printf("I2C debug: DISABLED\n");
-#endif
-  printf("I2C note: unmatched_addr_not_visible_in_slave_mode=1\n");
   
   // Pre-fill I2C buffer with safe data FIRST
   sensor1_mm = 1.75f;
@@ -589,14 +373,11 @@ int main() {
   
   // Start timers
   heartbeat_timer.start();
-  serial_timer.start();
-  i2c_check_timer.start();
-  i2c_debug_timer.start();
   uptime_timer.start();
   
   printf("Data ready. Starting I2C slave...\n");
   
-  // CRITICAL: Initialize I2C slave LAST after all data is ready
+  // Bring up the slave after payload initialization to avoid serving stale bytes.
   reinit_i2c_slave();
   
   // Start I2C slave thread - data is already prepared
@@ -644,17 +425,7 @@ int main() {
     __disable_irq();
     memcpy((void*)tx_buffer, temp_buf, 10);
     __enable_irq();
-    
-    // Check I2C connection status
-    check_i2c_connection();
 
-    // Consume queued I2C events outside of the I2C thread and print summary periodically.
-    consume_i2c_debug_events();
-    print_i2c_debug_info();
-    
-    // Print debug info
-    print_debug_info("Normal Mode");
-    
     ThisThread::sleep_for(2ms);
   }
 }
