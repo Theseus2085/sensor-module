@@ -11,8 +11,8 @@
  * - Calibration buttons on PB6/PB7
  * 
  * I2C Connection to Printer:
- * - SCL: PB8 - Connect to printer's I2C SCL
- * - SDA: PB9 - Connect to printer's I2C SDA  
+ * - SCL: PB8 - Connect to printer's I2C SCL D7
+ * - SDA: PB9 - Connect to printer's I2C SDA D8  
  * - GND: Common ground required
  * 
  * Framework: mbed OS
@@ -24,7 +24,7 @@
 // FIRMWARE CONFIGURATION
 // ============================================================================
 
-#define FW_VERSION "0.5.2"
+#define FW_VERSION "0.6.0"
 
 // ============================================================================
 // PIN DEFINITIONS
@@ -58,15 +58,12 @@ DigitalIn cal_next_btn(PB_7, PullUp);
 #if TEST_MODE
   #define TEST_SENSOR1_MM 1.99f
   #define TEST_SENSOR2_MM 1.99f
+  #define TEST_SENSOR1_X10000 ((uint32_t)(TEST_SENSOR1_MM * 10000.0f + 0.5f))
+  #define TEST_SENSOR2_X10000 ((uint32_t)(TEST_SENSOR2_MM * 10000.0f + 0.5f))
 #endif
 
-/* ADC Averaging Buffer */
-#define ADC_BUFFER_SIZE 64
-#define ADC_BUFFER_MASK (ADC_BUFFER_SIZE - 1)
-
-// ============================================================================
-// GLOBAL VARIABLES
-// ============================================================================
+#define SENSOR_MM_FIXED_SCALE 10000U
+#define SENSOR_MM_FIXED_MAX 99999U
 
 /* Sensor Measurements */
 volatile float sensor1_mm = 1.75f;
@@ -91,16 +88,6 @@ CalibrationPoint calibration_tables[2][3] = {
   }
 };
 
-/* ADC Circular Buffers for Averaging */
-uint16_t adc_buffer_sensor1[ADC_BUFFER_SIZE];
-uint16_t adc_buffer_sensor2[ADC_BUFFER_SIZE];
-uint16_t adc_buffer_index = 0;
-bool adc_buffer_filled = false;
-
-/* Spike Rejection - Last Valid Readings */
-uint16_t last_valid_raw1 = 532; 
-uint16_t last_valid_raw2 = 532;
-
 /* I2C Communication Buffer */
 volatile uint8_t tx_buffer[10] = {0};
 
@@ -116,7 +103,8 @@ Timer uptime_timer;
 // FORWARD DECLARATIONS
 // ============================================================================
 
-void format_sensor_data(float val, uint8_t* buf);
+uint32_t mm_to_fixed_10000(float val);
+void format_sensor_data_fixed(uint32_t val_x10000, uint8_t* buf);
 void reinit_i2c_slave();
 uint64_t get_uptime_us();
 
@@ -171,36 +159,8 @@ void measure_sensor_values(void) {
   uint16_t raw1 = read_sensor_raw_adc(0);
   uint16_t raw2 = read_sensor_raw_adc(1);
   
-  last_valid_raw1 = raw1;
-  last_valid_raw2 = raw2;
-  
-  adc_buffer_sensor1[adc_buffer_index] = last_valid_raw1;
-  adc_buffer_sensor2[adc_buffer_index] = last_valid_raw2;
-  
-  adc_buffer_index = (adc_buffer_index + 1) & ADC_BUFFER_MASK;
-  
-  if (adc_buffer_index == 0 && !adc_buffer_filled) {
-    adc_buffer_filled = true;
-  }
-  
-  uint32_t sum1 = 0;
-  uint32_t sum2 = 0;
-  uint16_t samples_to_average = adc_buffer_filled ? ADC_BUFFER_SIZE : adc_buffer_index;
-  
-  if (samples_to_average == 0) {
-    samples_to_average = 1;
-  }
-  
-  for (uint16_t i = 0; i < samples_to_average; i++) {
-    sum1 += adc_buffer_sensor1[i];
-    sum2 += adc_buffer_sensor2[i];
-  }
-  
-  uint16_t avg_raw1 = (uint16_t)(sum1 / samples_to_average);
-  uint16_t avg_raw2 = (uint16_t)(sum2 / samples_to_average);
-  
-  sensor1_mm = convert_raw_adc_to_mm(avg_raw1, 0);
-  sensor2_mm = convert_raw_adc_to_mm(avg_raw2, 1);
+  sensor1_mm = convert_raw_adc_to_mm(raw1, 0);
+  sensor2_mm = convert_raw_adc_to_mm(raw2, 1);
 }
 
 // ============================================================================
@@ -215,8 +175,8 @@ void calibration(void) {
   // Pre-fill buffer output to safe 1.75mm
   sensor1_mm = 1.75f; 
   sensor2_mm = 1.75f;
-  format_sensor_data(1.75f, (uint8_t*)&tx_buffer[0]);
-  format_sensor_data(1.75f, (uint8_t*)&tx_buffer[5]);
+  format_sensor_data_fixed(mm_to_fixed_10000(1.75f), (uint8_t*)&tx_buffer[0]);
+  format_sensor_data_fixed(mm_to_fixed_10000(1.75f), (uint8_t*)&tx_buffer[5]);
 
   for (int s = 0; s < 2; s++) {
     printf("Calibrating Sensor %d\n", s + 1);
@@ -252,17 +212,20 @@ void calibration(void) {
 // COMMUNICATION HELPERS
 // ============================================================================
 
-void format_sensor_data(float val, uint8_t* buf) {
+uint32_t mm_to_fixed_10000(float val) {
   if (val < 0.0f) val = 0.0f;
   if (val > 9.9999f) val = 9.9999f;
+  return (uint32_t)(val * (float)SENSOR_MM_FIXED_SCALE + 0.5f);
+}
 
-  uint32_t int_val = (uint32_t)(val * 10000.0f + 0.5f);
-  
-  buf[0] = (int_val / 10000) % 10;
-  buf[1] = (int_val / 1000) % 10;
-  buf[2] = (int_val / 100) % 10;
-  buf[3] = (int_val / 10) % 10;
-  buf[4] = (int_val / 1) % 10;
+void format_sensor_data_fixed(uint32_t val_x10000, uint8_t* buf) {
+  if (val_x10000 > SENSOR_MM_FIXED_MAX) val_x10000 = SENSOR_MM_FIXED_MAX;
+
+  buf[0] = (val_x10000 / 10000U) % 10U;
+  buf[1] = (val_x10000 / 1000U) % 10U;
+  buf[2] = (val_x10000 / 100U) % 10U;
+  buf[3] = (val_x10000 / 10U) % 10U;
+  buf[4] = val_x10000 % 10U;
 }
 
 uint64_t get_uptime_us() {
@@ -306,8 +269,16 @@ void i2c_slave_thread() {
       i2c_request_count++;
       last_i2c_request_time_us = get_uptime_us();
 
+      // In test mode, serve fixed test payload directly on each read.
+#if TEST_MODE
+      uint8_t test_payload[10];
+      format_sensor_data_fixed(TEST_SENSOR1_X10000, test_payload);
+      format_sensor_data_fixed(TEST_SENSOR2_X10000, test_payload + 5);
+      if (i2c_slave.write((const char *)test_payload, 10) != 0) {
+#else
       // Buffer is continuously refreshed by main loop; no copy/allocation here.
       if (i2c_slave.write((const char *)tx_buffer, 10) != 0) {
+#endif
         printf("I2C: read-response write failed, reinitializing slave\n");
         reinit_i2c_slave();
         continue;
@@ -347,29 +318,23 @@ int main() {
   printf("I2C: 400kHz Fast Mode\n");
   printf("Address7: 0x%02X\n", SENSOR_I2C_ADDRESS >> 1);
   printf("Address8: 0x%02X\n", SENSOR_I2C_ADDRESS);
-  
+
+#if TEST_MODE
+  sensor1_mm = TEST_SENSOR1_MM;
+  sensor2_mm = TEST_SENSOR2_MM;
+  printf("TEST_MODE active: direct fixed I2C payload (%.4f, %.4f)\n", TEST_SENSOR1_MM, TEST_SENSOR2_MM);
+#else
   // Pre-fill I2C buffer with safe data FIRST
   sensor1_mm = 1.75f;
   sensor2_mm = 1.75f;
-  format_sensor_data(1.75f, (uint8_t*)&tx_buffer[0]);
-  format_sensor_data(1.75f, (uint8_t*)&tx_buffer[5]);
-  
-  // Quick buffer fill with real ADC data
-  uint16_t r1 = (uint16_t)(sensor1.read() * 4095.0f);
-  uint16_t r2 = (uint16_t)(sensor2.read() * 4095.0f);
-  last_valid_raw1 = r1;
-  last_valid_raw2 = r2;
-  
-  for(int i=0; i<ADC_BUFFER_SIZE; i++) {
-     adc_buffer_sensor1[i] = r1;
-     adc_buffer_sensor2[i] = r2;
-  }
-  adc_buffer_filled = true;
-  
-  // Update I2C buffer with initial real measurements
+  format_sensor_data_fixed(mm_to_fixed_10000(1.75f), (uint8_t*)&tx_buffer[0]);
+  format_sensor_data_fixed(mm_to_fixed_10000(1.75f), (uint8_t*)&tx_buffer[5]);
+
+  // Initial measurement with real ADC data
   measure_sensor_values();
-  format_sensor_data(sensor1_mm, (uint8_t*)&tx_buffer[0]);
-  format_sensor_data(sensor2_mm, (uint8_t*)&tx_buffer[5]);
+  format_sensor_data_fixed(mm_to_fixed_10000(sensor1_mm), (uint8_t*)&tx_buffer[0]);
+  format_sensor_data_fixed(mm_to_fixed_10000(sensor2_mm), (uint8_t*)&tx_buffer[5]);
+#endif
   
   // Start timers
   heartbeat_timer.start();
@@ -410,21 +375,18 @@ int main() {
     }
     
     // Update sensor measurements and I2C buffer
+#if !TEST_MODE
     measure_sensor_values();
-    
+
     // Update I2C buffer atomically
     uint8_t temp_buf[10];
-#if TEST_MODE
-    format_sensor_data(TEST_SENSOR1_MM, temp_buf);
-    format_sensor_data(TEST_SENSOR2_MM, temp_buf + 5);
-#else
-    format_sensor_data(sensor1_mm, temp_buf);
-    format_sensor_data(sensor2_mm, temp_buf + 5);
-#endif
-    
+    format_sensor_data_fixed(mm_to_fixed_10000(sensor1_mm), temp_buf);
+    format_sensor_data_fixed(mm_to_fixed_10000(sensor2_mm), temp_buf + 5);
+
     __disable_irq();
     memcpy((void*)tx_buffer, temp_buf, 10);
     __enable_irq();
+#endif
 
     ThisThread::sleep_for(2ms);
   }
