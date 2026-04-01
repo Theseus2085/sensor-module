@@ -308,6 +308,19 @@ void led_heartbeat_thread() {
 }
 
 // ============================================================================
+// UART TEST STREAM THREAD (Outputs measurements every 250ms)
+// ============================================================================
+
+void uart_stream_thread() {
+  printf("UART test stream thread started\n");
+  while (true) {
+    // Output comma-separated values: Sensor1, Sensor2
+    printf("%.4f,%.4f\n", sensor1_mm, sensor2_mm);
+    ThisThread::sleep_for(250ms);
+  }
+}
+
+// ============================================================================
 // MAIN FUNCTION
 // ============================================================================
 
@@ -361,6 +374,11 @@ int main() {
   Thread led_thread(osPriorityNormal);
   led_thread.start(led_heartbeat_thread);
   printf("LED thread starting...\n");
+
+  // Start UART test stream thread for Mega 2560 bridge
+  Thread uart_thread(osPriorityNormal);
+  uart_thread.start(uart_stream_thread);
+  printf("UART test thread starting...\n");
 
   // Small delay to let threads initialize
   ThisThread::sleep_for(200ms);
