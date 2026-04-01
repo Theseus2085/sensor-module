@@ -1,0 +1,626 @@
+\chapter{Implementierung (Sensormodul)}
+\label{chap:sensormodul}
+
+Das vorangegangene Kapitel~\ref{chap:filwidth} beschrieb, wie die Druckerfirmware (Prusa/Marlin) Durchmessermesswerte empfängt, räumlich synchronisiert und volumetrisch integriert.
+Dieses Kapitel beschreibt die Gegenseite: die Firmware des externen Sensormoduls, das eben jene Messwerte erzeugt und über den I\textsuperscript{2}C-Bus bereitstellt.
+
+Das Modul basiert auf einem STM32F446RE-Mikrocontroller (NUCLEO-F446RE), nutzt das mbed-OS-Framework und erfasst mittels zweier Hall-Effekt-Sensoren (SS495A) den Filamentdurchmesser in zwei orthogonalen Achsen.
+Die aufbereiteten Messwerte werden als 10-Byte-Frame über eine I\textsuperscript{2}C-Slave-Schnittstelle an die in Kapitel~\ref{chap:filwidth} beschriebene Empfangslogik übertragen.
+
+\section{Systemübersicht und Datenfluss}
+
+Aufgabe des Sensormoduls ist die Erfassung des physischen Filamentdurchmessers mit hoher zeitlicher Auflösung sowie dessen digitale Bereitstellung für die Druckerfirmware.
+Im Gesamtsystem (vgl.\ Abbildung~\ref{fig:dataflow_overview}\todo{ggf.\ Verweis auf eigene Abbildung}) bildet das Sensormodul die Messdatenquelle; die Folgeschritte (Ringpuffer, Retraction-Debt, Lookahead Averaging, Extrusionskorrektur) wurden bereits in Kapitel~\ref{chap:filwidth} behandelt.
+
+\textbf{Verarbeitungsschritte eines Messwertes im Sensormodul:}
+\begin{enumerate}
+  \item \textbf{ADC-Burst-Oversampling:} Erfassung der analogen Hall-Sensorspannung über \num{16} Einzelmessungen pro Kanal und arithmetische Mittelung (Abschnitt~\ref{sec:sensor_adc}).
+  \item \textbf{Linearisierung:} Umrechnung des gemittelten ADC-Rohwerts in einen metrischen Durchmesser (Millimeter) mittels stückweise linearer Interpolation über drei Kalibrierungspunkte (Abschnitt~\ref{sec:sensor_linearisierung}).
+  \item \textbf{Fixed-Point-Skalierung:} Umwandlung des Gleitkomma-Durchmessers in ein \num{10000}-fach skaliertes Ganzzahlformat (Abschnitt~\ref{sec:sensor_formatierung}).
+  \item \textbf{Ziffernformatierung:} Zerlegung des skalierten Werts in fünf einzelne Dezimalziffern (Bytewerte \texttt{0\dots9}).
+  \item \textbf{Atomare Pufferübernahme:} Konsistentes Kopieren des formatierten 10-Byte-Frames in den globalen Sendepuffer unter Interrupt-Sperre (Abschnitt~\ref{sec:sensor_atomare_uebernahme}).
+  \item \textbf{I\textsuperscript{2}C-Bereitstellung:} Asynchrone Auslieferung des letzten konsistenten Frames an den anfragenden Host (Abschnitt~\ref{sec:sensor_i2c}).
+\end{enumerate}
+
+\section{Hardware- und Softwarekontext}
+
+\minisec{Hardware}
+
+\begin{itemize}
+  \item \textbf{MCU:} STM32F446RE (ARM Cortex-M4, \qty{180}{\mega\hertz}), auf NUCLEO-F446RE Evaluationsboard.
+  \item \textbf{Sensorik:} 2$\times$ Hall-Effekt-Sensor (SS495A) an den ADC-Eingängen:
+    \begin{itemize}
+      \item Sensor~1: \texttt{PA\_0} (\texttt{ADC1\_IN0})
+      \item Sensor~2: \texttt{PA\_1} (\texttt{ADC1\_IN1})
+    \end{itemize}
+  \item \textbf{I\textsuperscript{2}C-Slave:}
+    \begin{itemize}
+      \item SDA: \texttt{PB\_9}, SCL: \texttt{PB\_8}
+      \item 7-Bit-Adresse: \texttt{0x42} (8-Bit: \texttt{0x84})
+      \item Fast Mode: \qty{400}{\kilo\hertz}
+    \end{itemize}
+  \item \textbf{Bedienelemente:}
+    \begin{itemize}
+      \item Kalibrier-Start-Taster: \texttt{PB\_6} / Arduino D10 (Pull-Up)
+      \item Kalibrier-Schritt-Taster: \texttt{PA\_9} / Arduino D8 (Pull-Up)
+    \end{itemize}
+  \item \textbf{Statusausgabe:} LED auf \texttt{PA\_5}, USB-Serial bei \qty{115200}{\baud}.
+\end{itemize}
+
+Die I\textsuperscript{2}C-Adresse \texttt{0x42} ist absichtlich identisch mit dem in Kapitel~\ref{chap:filwidth} (Listing~\ref{lst:i2c_read}) konfigurierten Wert \texttt{sensor\_address}.
+Das mbed-OS-API \texttt{I2CSlave::address()} erwartet die 8-Bit-Form (\texttt{0x84 = 0x42 \textless\textless\ 1}), was in der Firmware als Präprozessorkonstante festgelegt ist:
+
+\begin{lstlisting}[style=firmwarestyle, caption={I\textsuperscript{2}C-Adresskonfiguration (\texttt{main.cpp}, Z.~36--37).}, label={lst:sensor_addr}]
+#define SENSOR_I2C_ADDRESS 0x84
+#define SENSOR_I2C_FREQUENCY_HZ 400000
+\end{lstlisting}
+
+\minisec{Software}
+
+\begin{itemize}
+  \item \textbf{Framework:} mbed OS (PlatformIO)
+  \item \textbf{Build-Umgebungen:}
+    \begin{itemize}
+      \item \texttt{env:nucleo\_f446re} -- Produktiv-Target
+      \item \texttt{env:nucleo\_f446re\_dbg} -- Debug-Target mit I\textsuperscript{2}C-Instrumentierung (\texttt{-DI2C\_DEBUG\_ENABLE=1}, konfigurierbare Event-Queue und Print-Periode)
+    \end{itemize}
+  \item \textbf{Referenzdatei:} \texttt{src/main.cpp} (FW~0.6.0, \num{394}~Zeilen)
+\end{itemize}
+
+\section{Laufzeitarchitektur (Nebenläufigkeit)}
+\label{sec:sensor_threading}
+
+Die Firmware nutzt drei Ausführungskontexte, die durch das mbed-OS-Threading-Modell realisiert werden.
+Dadurch wird verhindert, dass I\textsuperscript{2}C-Bustransaktionen die deterministische Ausführung der Messwertaufbereitung blockieren.
+
+\begin{enumerate}
+  \item \textbf{Main-Thread} (\texttt{main}, Default-Priorität):
+    \begin{itemize}
+      \item Zyklische Sensorabtastung (ADC-Burst) und Signalverarbeitung.
+      \item Formatierung und atomare Übernahme des 10-Byte-Frames in den globalen Sendepuffer.
+      \item Abfrage des Kalibrier-Tasters und Durchführung der Kalibrierungsprozedur.
+    \end{itemize}
+  \item \textbf{I\textsuperscript{2}C-Slave-Thread} (\texttt{i2c\_slave\_thread}, \texttt{osPriorityRealtime}):
+    \begin{itemize}
+      \item Polling-basierte Behandlung von I\textsuperscript{2}C-Busereignissen.
+      \item Bei Read-Requests: Auslieferung des aktuellen 10-Byte-Sendepuffers.
+    \end{itemize}
+  \item \textbf{LED-Heartbeat-Thread} (\texttt{led\_heartbeat\_thread}, \texttt{osPriorityNormal}):
+    \begin{itemize}
+      \item Reine Lebendanzeige (\qty{200}{\milli\second} Ein / \qty{200}{\milli\second} Aus).
+      \item Funktional vollständig von der Messkette entkoppelt -- blinkt auch bei Blockade des Main-Threads weiter.
+    \end{itemize}
+\end{enumerate}
+
+\begin{lstlisting}[style=firmwarestyle, caption={Thread-Erzeugung und Initialisierung in \texttt{main()} (\texttt{main.cpp}, Z.~311--361).}, label={lst:sensor_thread_creation}]
+int main() {
+  led = 1;
+
+  // ... (UART-Banner, Pre-fill des I2C-Puffers auf 1.75 mm)
+
+  // Initial measurement with real ADC data
+  measure_sensor_values();
+  format_sensor_data_fixed(
+    mm_to_fixed_10000(sensor1_mm), (uint8_t*)&tx_buffer[0]);
+  format_sensor_data_fixed(
+    mm_to_fixed_10000(sensor2_mm), (uint8_t*)&tx_buffer[5]);
+
+  heartbeat_timer.start();
+  uptime_timer.start();
+
+  // Bring up the slave after payload initialization
+  // to avoid serving stale bytes.
+  reinit_i2c_slave();
+
+  // I2C thread: highest priority for bus latency
+  Thread i2c_thread(osPriorityRealtime);
+  i2c_thread.start(i2c_slave_thread);
+
+  // LED thread: independent heartbeat
+  Thread led_thread(osPriorityNormal);
+  led_thread.start(led_heartbeat_thread);
+
+  ThisThread::sleep_for(200ms);
+
+  // Main loop: continuous measurement + atomic buffer update
+  while (true) {
+    // ... (calibration check, sensor measurement)
+    ThisThread::sleep_for(2ms);
+  }
+}
+\end{lstlisting}
+
+\section{Messwertaufnahme und Signalverarbeitung}
+\label{sec:sensor_adc}
+
+\minisec{ADC-Burst-Oversampling}
+
+Pro Messkanal werden \num{16} aufeinanderfolgende Einzelmessungen des 12-Bit-ADC durchgeführt und arithmetisch gemittelt.
+Dies realisiert einen \textbf{diskreten Tiefpass erster Ordnung} (FIR-Filter mit rechteckigem Fenster der Länge~\num{16}), der hochfrequentes Rauschen um ca.\ $10 \cdot \log_{10}(16) \approx \qty{12}{\deci\bel}$ reduziert, bevor der Wert in die Linearisierung eingeht.
+
+\begin{lstlisting}[style=firmwarestyle, caption={ADC-Burst-Oversampling (\texttt{read\_sensor\_raw\_adc}, Z.~115--127).}, label={lst:sensor_adc_burst}]
+uint16_t read_sensor_raw_adc(uint8_t sensor_idx) {
+  AnalogIn* sensor_pin =
+    (sensor_idx == 0) ? &sensor1 : &sensor2;
+
+  // Oversample with 16-sample burst (12-bit ADC)
+  const int burstCount = 16;
+  int32_t burstSum = 0;
+  for (int k = 0; k < burstCount; k++) {
+    burstSum += (uint16_t)(sensor_pin->read() * 4095.0f);
+  }
+
+  uint16_t averaged = (uint16_t)(burstSum / burstCount);
+  return averaged;
+}
+\end{lstlisting}
+
+\minisec{Entfall der sensormodul-seitigen Glättung (ab FW~0.6.0)}
+
+Bis FW~0.5.x wurde im Sensormodul zusätzlich ein 64-Sample-Ringpuffer (gleitender Mittelwert) betrieben.
+Dieser wurde ab FW~0.6.0 entfernt, da das Mittelungsfenster ($64 \times \qty{2}{\milli\second} \approx \qty{128}{\milli\second}$) ein willkürlich gewähltes Zeitfenster darstellte, das \textbf{nicht} an die Planungsgranularität des Druckers gekoppelt war.
+
+In der neuen Architektur übernimmt die Druckerfirmware die Glättung per \emph{Lookahead Averaging} (siehe Kapitel~\ref{chap:filwidth}, Listing~\ref{lst:lookahead_simulator}): Für jeden G-Code-Extrusionsblock wird das Längen-gewichtete Integral aller im Planungsabschnitt anfallenden Querschnittsflächen gebildet.
+Damit entspricht das Mittelungsfenster exakt der jeweiligen physischen Extrusionslänge statt einem arbiträren Zeitfenster.
+Das Sensormodul liefert nun \textbf{ungefilterte, burst-gemittelte Einzelmesswerte} mit maximaler zeitlicher Auflösung.
+
+Ebenfalls entfernt wurde die \texttt{last\_valid\_raw}-Logik (FW~$\leq$~0.5.x), die im ursprünglichen Code keine tatsächliche Ausreißerunterdrückung implementierte.
+
+\section{Ermittlung des Durchmessers (Linearisierung)}
+\label{sec:sensor_linearisierung}
+
+Die Umrechnung vom gemittelten ADC-Rohwert in den physikalischen Durchmesser (Millimeter) erfolgt je Sensor über eine \textbf{stückweise lineare Interpolation} mit drei Kalibrierungspunkten.
+
+Die Kalibrierungstabelle wird als Struktur im Speicher vorgehalten:
+\begin{lstlisting}[style=firmwarestyle, caption={Kalibrierdatenstruktur (\texttt{main.cpp}, Z.~73--89).}, label={lst:sensor_cal_table}]
+struct CalibrationPoint {
+  uint16_t raw_adc;
+  float diameter_mm;
+};
+
+CalibrationPoint calibration_tables[2][3] = {
+  { // Sensor 1
+    {7, 1.47f}, {532, 1.68f}, {1119, 1.99f}
+  },
+  { // Sensor 2
+    {7, 1.47f}, {532, 1.68f}, {1119, 1.99f}
+  }
+};
+\end{lstlisting}
+
+Die Standardwerte bei Programmstart lauten:
+\begin{center}
+  \begin{tabular}{l c c c}
+    \toprule
+    & Punkt 0 & Punkt 1 & Punkt 2 \\
+    \midrule
+    $\mathtt{raw}$ & 7 & 532 & 1119 \\
+    $d$ [\unit{\milli\meter}] & 1{,}47 & 1{,}68 & 1{,}99 \\
+    \bottomrule
+  \end{tabular}
+\end{center}
+
+\minisec{Interpolationslogik}
+
+Die Auswahl des aktiven Segments geschieht anhand des mittleren Kalibrierungspunkts $\mathtt{raw}_1$:
+
+\textbf{Fall~A} ($\mathtt{raw\_adc} \leq \mathtt{raw}_1$):
+\begin{equation}
+  d = d_0 + \frac{d_1 - d_0}{\mathtt{raw}_1 - \mathtt{raw}_0} \cdot (\mathtt{raw\_adc} - \mathtt{raw}_0)
+  \label{eq:sensor_interp_a}
+\end{equation}
+
+\textbf{Fall~B} ($\mathtt{raw\_adc} > \mathtt{raw}_1$):
+\begin{equation}
+  d = d_1 + \frac{d_2 - d_1}{\mathtt{raw}_2 - \mathtt{raw}_1} \cdot (\mathtt{raw\_adc} - \mathtt{raw}_1)
+  \label{eq:sensor_interp_b}
+\end{equation}
+
+\textbf{Numerische Schutzmassnahme:} Ist der Nenner eines Segments gleich Null (identische ADC-Rohwerte zweier Kalibrierungspunkte), wird auf den Durchmesser des linken Intervallpunktes zurückgefallen.
+
+\textbf{Wichtige Eigenschaft:} Es wird \emph{nicht} auf den Bereich $[\mathtt{raw}_0, \mathtt{raw}_2]$ geclampt.
+Außerhalb des Kalibrierbereichs erfolgt lineare Extrapolation, was bei extremen Rohwerten zu unplausiblen Durchmessern führen kann.
+
+\begin{lstlisting}[style=firmwarestyle, caption={Stückweise lineare Interpolation (\texttt{convert\_raw\_adc\_to\_mm}, Z.~129--156).}, label={lst:sensor_convert_raw}]
+float convert_raw_adc_to_mm(uint16_t raw_adc,
+                            uint8_t sensor_idx) {
+  if (sensor_idx >= 2) return 1.75f;
+
+  const CalibrationPoint* table =
+    calibration_tables[sensor_idx];
+  float diameter;
+
+  if (raw_adc <= table[1].raw_adc) {
+    int32_t denom = (int32_t)table[1].raw_adc
+                  - (int32_t)table[0].raw_adc;
+    if (denom == 0) {
+      diameter = table[0].diameter_mm;
+    } else {
+      float slope = (table[1].diameter_mm
+                   - table[0].diameter_mm) / (float)denom;
+      diameter = table[0].diameter_mm
+               + slope * (float)((int32_t)raw_adc
+                       - (int32_t)table[0].raw_adc);
+    }
+  } else {
+    int32_t denom = (int32_t)table[2].raw_adc
+                  - (int32_t)table[1].raw_adc;
+    if (denom == 0) {
+      diameter = table[1].diameter_mm;
+    } else {
+      float slope = (table[2].diameter_mm
+                   - table[1].diameter_mm) / (float)denom;
+      diameter = table[1].diameter_mm
+               + slope * (float)((int32_t)raw_adc
+                       - (int32_t)table[1].raw_adc);
+    }
+  }
+  return diameter;
+}
+\end{lstlisting}
+
+Die beiden Ergebnisse fließen auf Empfängerseite (Kapitel~\ref{chap:filwidth}, Listing~\ref{lst:equivalent_diameter}) in die Berechnung des elliptischen Äquivalenzdurchmessers ein:
+$D_\text{eq} = \sqrt{D_X \cdot D_Y}$.
+
+\section{Kalibrierprozess}
+\label{sec:sensor_kalibrierung}
+
+Die Kalibrierung wird durch den Taster an \texttt{PB\_6} / Arduino D10 (Start) initiiert und durchläuft für beide Sensoren jeweils drei Referenzpunkte bei den Soll-Durchmessern \qty{1,50}{\milli\meter}, \qty{1,75}{\milli\meter} und \qty{2,00}{\milli\meter}.
+
+\textbf{Ablauf:}
+\begin{enumerate}
+  \item \textbf{Sicherheitszustand:} Sofortige Initialisierung beider Sensorausgaben auf den Nominalwert \qty{1,75}{\milli\meter}, damit der Drucker während der Kalibrierung keinen pathologischen Durchmesser empfängt.
+  \item \textbf{Referenzpunkt-Erfassung:} Für jeden Sensor ($s \in \{1, 2\}$) und Kalibrierungspunkt ($p \in \{1, 2, 3\}$):
+    \begin{enumerate}
+      \item Aufforderung über USB-Serial.
+      \item Benutzer legt die zugehörige Kalibrierungsreferenz ein und betätigt den \texttt{NEXT}-Taster (\texttt{PA\_9} / Arduino D8).
+      \item ADC-Rohwert wird via \texttt{read\_sensor\_raw\_adc(s)} erfasst und mit dem Soll-Durchmesser gepaart.
+      \item \qty{50}{\milli\second} Entprellung nach Tastendruck und -freigabe.
+    \end{enumerate}
+  \item \textbf{Übernahme:} Die neuen Kalibrierungspunkte ersetzen sofort die Einträge in \texttt{calibration\_tables[s][p]}.
+\end{enumerate}
+
+\textbf{Einschränkung:} Die Kalibrierungsdaten liegen ausschließlich im RAM (volatil).
+Nach einem Reset oder Power-Cycle gehen benutzerdefinierte Kalibrierungen verloren und die Firmware fällt auf die kompilierten Standardwerte zurück.
+
+Während der Wartephase auf den \texttt{NEXT}-Taster wird die Messwerterfassung (\texttt{measure\_sensor\_values()}) weiterhin alle \qty{10}{\milli\second} aufgerufen, sodass der I\textsuperscript{2}C-Sendepuffer auch während der Kalibrierung stets einen aktuellen Frame enthält.
+
+\begin{lstlisting}[style=firmwarestyle, caption={Kalibrierprozedur (\texttt{calibration}, Z.~170--209).}, label={lst:sensor_calibration}]
+void calibration(void) {
+  printf("\n=== Calibration Started ===\n");
+
+  float diameters[] = {1.50f, 1.75f, 2.00f};
+
+  // Pre-fill buffer output to safe 1.75mm
+  sensor1_mm = 1.75f;
+  sensor2_mm = 1.75f;
+  format_sensor_data_fixed(
+    mm_to_fixed_10000(1.75f), (uint8_t*)&tx_buffer[0]);
+  format_sensor_data_fixed(
+    mm_to_fixed_10000(1.75f), (uint8_t*)&tx_buffer[5]);
+
+  for (int s = 0; s < 2; s++) {
+    printf("Calibrating Sensor %d\n", s + 1);
+    for (int p = 0; p < 3; p++) {
+      printf("  S%d Point %d (%.2fmm)"
+             " - Press NEXT button...\n",
+             s + 1, p + 1, diameters[p]);
+
+      // Wait for button press (continue measuring)
+      while(cal_next_btn.read() == 1) {
+        ThisThread::sleep_for(10ms);
+        measure_sensor_values();
+      }
+      ThisThread::sleep_for(50ms);
+
+      // Capture calibration point
+      calibration_tables[s][p].raw_adc =
+        read_sensor_raw_adc(s);
+      calibration_tables[s][p].diameter_mm = diameters[p];
+
+      // Wait for button release + debounce
+      while(cal_next_btn.read() == 0) {
+        ThisThread::sleep_for(10ms);
+      }
+      ThisThread::sleep_for(50ms);
+    }
+  }
+  printf("=== Calibration Complete ===\n\n");
+}
+\end{lstlisting}
+
+\section{Datenformatierung und I\textsuperscript{2}C-Kommunikation}
+\label{sec:sensor_formatierung}
+
+\minisec{Fixed-Point-Skalierung und Ziffernformatierung}
+
+Der Gleitkomma-Durchmesser wird zweistufig in das I\textsuperscript{2}C-Payload-Format überführt.
+Dieses Format ist das direkte Gegenstück zu der in Kapitel~\ref{chap:filwidth} (Listing~\ref{lst:byte_parser}) beschriebenen Dekodierlogik \texttt{decode\_axis\_digits}, die auf Druckerseite die empfangenen Bytes wieder in einen skalierten Integer entpackt.
+
+\minisec{Stufe~1: Skalierung auf Ganzzahl}
+
+Die Funktion \texttt{mm\_to\_fixed\_10000(val)} multipliziert den Gleitkommawert mit dem Faktor \num{10000} und rundet kaufmännisch (Addition von $0{,}5$ vor Abschneiden).
+Eingabewerte werden auf den Bereich $[0{,}0;\; 9{,}9999]$ geclampt.
+
+\begin{equation}
+  \mathtt{val\_x10000} = \lfloor \mathtt{val} \cdot 10000 + 0{,}5 \rfloor
+\end{equation}
+
+\begin{lstlisting}[style=firmwarestyle, caption={Fixed-Point-Skalierung (\texttt{mm\_to\_fixed\_10000}, Z.~215--219).}, label={lst:sensor_mm_to_fixed}]
+uint32_t mm_to_fixed_10000(float val) {
+  if (val < 0.0f) val = 0.0f;
+  if (val > 9.9999f) val = 9.9999f;
+  return (uint32_t)(val * (float)SENSOR_MM_FIXED_SCALE
+                    + 0.5f);
+}
+\end{lstlisting}
+
+\minisec{Stufe~2: Dezimalzerlegung in Einzelziffern}
+
+Die Funktion \texttt{format\_sensor\_data\_fixed(val\_x10000, buf)} zerlegt den skalierten Wert durch fortlaufende Ganzzahldivision und Modulo-Operationen in fünf Dezimalziffern.
+Die Ziffernfolge $d_4 d_3 d_2 d_1 d_0$ repräsentiert den Wert $d_4{,}d_3 d_2 d_1 d_0$~mm.
+
+\textbf{Wichtig:} Es werden \emph{Bytewerte} \texttt{0\dots9} geschrieben, \emph{keine} ASCII-Zeichen (\texttt{'0'}\dots\texttt{'9'}).
+Dies erklärt, warum der Parser auf Empfängerseite (Kapitel~\ref{chap:filwidth}, Listing~\ref{lst:byte_parser}) sowohl rohe Binärwerte ($\leq 9$) als auch ASCII-kodierte Ziffern (\texttt{'0'}--\texttt{'9'}) akzeptiert.
+
+\begin{lstlisting}[style=firmwarestyle, caption={Ziffernformatierung (\texttt{format\_sensor\_data\_fixed}, Z.~221--229).}, label={lst:sensor_format_fixed}]
+void format_sensor_data_fixed(uint32_t val_x10000,
+                              uint8_t* buf) {
+  if (val_x10000 > SENSOR_MM_FIXED_MAX)
+    val_x10000 = SENSOR_MM_FIXED_MAX;
+
+  buf[0] = (val_x10000 / 10000U) % 10U;  // Einer (mm)
+  buf[1] = (val_x10000 / 1000U)  % 10U;  // 1/10
+  buf[2] = (val_x10000 / 100U)   % 10U;  // 1/100
+  buf[3] = (val_x10000 / 10U)    % 10U;  // 1/1000
+  buf[4] =  val_x10000           % 10U;  // 1/10000
+}
+\end{lstlisting}
+
+\minisec{Atomare Pufferübernahme}
+\label{sec:sensor_atomare_uebernahme}
+
+Main-Thread und I\textsuperscript{2}C-Thread greifen konkurrierend auf den globalen Sendepuffer \texttt{tx\_buffer[10]} zu.
+Um sogenannte \emph{Torn Reads} (ein Frame mit teilweise alten und teilweise neuen Daten) zu verhindern, wird ein zweistufiges Verfahren angewandt:
+
+\begin{enumerate}
+  \item Der Main-Thread formatiert zunächst in einen lokalen Puffer \texttt{temp\_buf[10]}.
+  \item Anschließend wird der globale Puffer unter Interrupt-Sperre via \texttt{memcpy} atomar übernommen.
+\end{enumerate}
+
+\begin{lstlisting}[style=firmwarestyle, caption={Atomare Pufferübernahme in der Hauptschleife (\texttt{main.cpp}, Z.~378--388).}, label={lst:sensor_atomic_copy}]
+// Main loop (ongoing):
+measure_sensor_values();
+
+// Format into local staging buffer
+uint8_t temp_buf[10];
+format_sensor_data_fixed(
+  mm_to_fixed_10000(sensor1_mm), temp_buf);
+format_sensor_data_fixed(
+  mm_to_fixed_10000(sensor2_mm), temp_buf + 5);
+
+// Critical section: atomic swap into global TX buffer
+__disable_irq();
+memcpy((void*)tx_buffer, temp_buf, 10);
+__enable_irq();
+\end{lstlisting}
+
+\textbf{Anmerkung:} Das Deaktivieren aller Interrupts (\texttt{\_\_disable\_irq()}) ist auf der STM32-Plattform für einen einzelnen \texttt{memcpy} von \num{10}~Bytes ($<\qty{1}{\micro\second}$) akzeptabel und führt nicht zu I\textsuperscript{2}C-Bus-Timeouts.
+
+\minisec{I\textsuperscript{2}C-Slave-Thread und Kommunikationsvertrag}
+\label{sec:sensor_i2c}
+
+Der I\textsuperscript{2}C-Slave-Thread läuft mit Echtzeit-Priorität (\texttt{osPriorityRealtime}) und pollt den Bus-Status mittels \texttt{i2c\_slave.receive()}.
+
+\minisec{Busparameter}
+\begin{itemize}
+  \item Fast Mode: \qty{400}{\kilo\hertz}
+  \item Slave-Adresse: \texttt{0x84} (8-Bit), entsprechend \texttt{0x42} (7-Bit)
+\end{itemize}
+
+\minisec{Reaktionsverhalten}
+\begin{itemize}
+  \item \textbf{\texttt{NoData}:} Kurzer Sleep (\qty{1}{\milli\second}) zur CPU-Entlastung, ohne die Service-Latenz bei adressierten Transaktionen zu erhöhen.
+  \item \textbf{\texttt{WriteGeneral} / \texttt{WriteAddressed}:} Best-effort: ein Byte wird gelesen und verworfen, um die I\textsuperscript{2}C-Statemachine zu quittieren.
+  \item \textbf{\texttt{ReadAddressed}:} Primärpfad -- der aktuelle 10-Byte-Sendepuffer wird ausgeliefert. Die Diagnosezähler (\texttt{i2c\_request\_count}, \texttt{last\_i2c\_request\_time\_us}) werden aktualisiert.
+\end{itemize}
+
+\minisec{Fehlerpfad}
+Schlägt \texttt{i2c\_slave.write()} fehl (Rückgabewert $\neq 0$), wird die gesamte Slave-Peripherie neu initialisiert:
+
+\begin{lstlisting}[style=firmwarestyle, caption={Peripheral-Reinitialisierung (\texttt{reinit\_i2c\_slave}, Z.~236--241).}, label={lst:sensor_reinit}]
+void reinit_i2c_slave() {
+  i2c_slave.stop();
+  // mbed reinitializes the peripheral in frequency()
+  i2c_slave.frequency(SENSOR_I2C_FREQUENCY_HZ);
+  i2c_slave.address(SENSOR_I2C_ADDRESS);
+}
+\end{lstlisting}
+
+\begin{lstlisting}[style=firmwarestyle, caption={I\textsuperscript{2}C-Slave-Thread (\texttt{i2c\_slave\_thread}, Z.~247--291).}, label={lst:sensor_i2c_slave}]
+void i2c_slave_thread() {
+  while (true) {
+    int status = i2c_slave.receive();
+
+    if (status == I2CSlave::NoData) {
+      // Yield CPU while idle
+      ThisThread::sleep_for(1ms);
+      continue;
+    }
+
+    if (status == I2CSlave::WriteGeneral) {
+      char dummy;
+      (void)i2c_slave.read(&dummy, 1);
+    }
+    else if (status == I2CSlave::WriteAddressed) {
+      char dummy;
+      (void)i2c_slave.read(&dummy, 1);
+    }
+    else if (status == I2CSlave::ReadAddressed) {
+      i2c_request_count++;
+      last_i2c_request_time_us = get_uptime_us();
+
+      if (i2c_slave.write(
+            (const char *)tx_buffer, 10) != 0) {
+        printf("I2C: write failed, reinit slave\n");
+        reinit_i2c_slave();
+        continue;
+      }
+    }
+
+    ThisThread::yield();
+  }
+}
+\end{lstlisting}
+
+\minisec{I\textsuperscript{2}C-Payload-Layout}
+
+Der 10-Byte-Frame ist folgendermaßen aufgebaut und wird auf Empfängerseite durch \texttt{decode\_sensor\_payload()} (vgl.\ Kapitel~\ref{chap:filwidth}, Listing~\ref{lst:i2c_read}) gelesen:
+
+\begin{center}
+  \begin{tabular}{c c l}
+    \toprule
+    Byte-Index & Zuordnung & Semantik \\
+    \midrule
+    0 & Sensor~1 & Ganzzahl-Stelle (mm) \\
+    1 & Sensor~1 & 1.\ Nachkommastelle ($10^{-1}$) \\
+    2 & Sensor~1 & 2.\ Nachkommastelle ($10^{-2}$) \\
+    3 & Sensor~1 & 3.\ Nachkommastelle ($10^{-3}$) \\
+    4 & Sensor~1 & 4.\ Nachkommastelle ($10^{-4}$) \\
+    5 & Sensor~2 & Ganzzahl-Stelle (mm) \\
+    6 & Sensor~2 & 1.\ Nachkommastelle ($10^{-1}$) \\
+    7 & Sensor~2 & 2.\ Nachkommastelle ($10^{-2}$) \\
+    8 & Sensor~2 & 3.\ Nachkommastelle ($10^{-3}$) \\
+    9 & Sensor~2 & 4.\ Nachkommastelle ($10^{-4}$) \\
+    \bottomrule
+  \end{tabular}
+\end{center}
+
+\textbf{Beispiel:} Ein Durchmesser von \qty{1,7500}{\milli\meter} wird als Bytefolge \texttt{\{0x01, 0x07, 0x05, 0x00, 0x00\}} übertragen (Bytewerte, nicht ASCII).
+
+\section{Testmodus}
+\label{sec:sensor_testmodus}
+
+Für Integrations- und Abnahmeprüfung bietet die Firmware einen kompilierbar konfigurierbaren \textbf{Testmodus} (\texttt{TEST\_MODE~=~1}).
+
+Im Testmodus:
+\begin{itemize}
+  \item werden \textbf{keine} ADC-Sensoren abgefragt,
+  \item der I\textsuperscript{2}C-Slave-Thread liefert bei jedem Read-Request einen \textbf{deterministischen Fixed-Payload} mit den zur Kompilierzeit definierten Werten (\texttt{TEST\_SENSOR1\_MM}, \texttt{TEST\_SENSOR2\_MM}),
+  \item die Main-Loop überspringt die Sensoraktualisierung.
+\end{itemize}
+
+Dies ermöglicht die End-to-End-Verifikation der gesamten I\textsuperscript{2}C-Kommunikationskette (Payload-Dekodierung, Ringpuffer-Enqueue/Dequeue, Volumetrische Korrektur) auf Druckerseite mit bekannten, reproduzierbaren Eingangsdaten.
+
+\begin{lstlisting}[style=firmwarestyle, caption={Testmodus-Konfiguration (\texttt{main.cpp}, Z.~56--63).}, label={lst:sensor_test_mode}]
+#define TEST_MODE 0
+
+#if TEST_MODE
+  #define TEST_SENSOR1_MM 1.99f
+  #define TEST_SENSOR2_MM 1.99f
+  #define TEST_SENSOR1_X10000 \
+    ((uint32_t)(TEST_SENSOR1_MM * 10000.0f + 0.5f))
+  #define TEST_SENSOR2_X10000 \
+    ((uint32_t)(TEST_SENSOR2_MM * 10000.0f + 0.5f))
+#endif
+\end{lstlisting}
+
+\section{Zeitverhalten}
+\label{sec:sensor_timing}
+
+\begin{center}
+  \begin{tabular}{l l l}
+    \toprule
+    Kontext & Zielperiode & Bemerkung \\
+    \midrule
+    Main-Loop (Messung) & $\approx \qty{2}{\milli\second}$ & \texttt{sleep\_for(2ms)} + Rechenzeit \\
+    I\textsuperscript{2}C-Service & eventgesteuert & \qty{1}{\milli\second} Idle-Polling \\
+    Sensor-Poll (Drucker) & \qty{250}{\milli\second} & konfiguriert in Drucker-FW \\
+    LED-Heartbeat & \qty{400}{\milli\second} & \qty{200}{\milli\second} Ein / \qty{200}{\milli\second} Aus \\
+    \bottomrule
+  \end{tabular}
+\end{center}
+
+Die effektive Messrate des Sensormoduls ($\approx \qty{500}{\hertz}$) ist bewusst deutlich höher als die Abtastrate der Drucker-Firmware (\qty{4}{\hertz}, konfiguriert als \texttt{sensor\_poll\_interval\_ms} in Kapitel~\ref{chap:filwidth}).
+Dadurch enthält der Sendepuffer bei jeder I\textsuperscript{2}C-Anfrage stets einen aktuellen, burst-gemittelten Messwert.
+Das Sensormodul ist somit nie der Engpass in der Messkette.
+
+\section{Initialisierungsreihenfolge}
+\label{sec:sensor_init}
+
+Die Reihenfolge der Initialisierung in \texttt{main()} ist sicherheitskritisch:
+
+\begin{enumerate}
+  \item \textbf{LED einschalten} -- visuelle Rückmeldung, dass die Firmware läuft.
+  \item \textbf{I\textsuperscript{2}C-Puffer vorbelegen} (\qty{1,75}{\milli\meter}) -- bevor der I\textsuperscript{2}C-Bus aktiv wird, enthält der Puffer einen sicheren Nominalwert.
+  \item \textbf{Erste ADC-Messung} -- der vorbesetzte Puffer wird sofort durch reale Sensordaten ersetzt.
+  \item \textbf{I\textsuperscript{2}C-Slave starten} (\texttt{reinit\_i2c\_slave()}) -- erst jetzt wird der Bus aktiv, da der Puffer garantiert gültige Daten enthält.
+  \item \textbf{I\textsuperscript{2}C-Thread starten} -- beginnt mit dem Polling auf Busanfragen.
+  \item \textbf{LED-Thread starten} -- Heartbeat-Anzeige.
+  \item \textbf{Wartezeit} (\qty{200}{\milli\second}) -- Threads stabilisieren sich.
+  \item \textbf{Hauptschleife} -- zyklische Messwerterfassung und Pufferaktualisierung.
+\end{enumerate}
+
+\textbf{Rationale:} Würde der I\textsuperscript{2}C-Slave gestartet, bevor der Puffer initialisiert ist, könnte die Drucker-Firmware Null-Bytes oder uninitialisierten Speicher lesen (Durchmesser \qty{0}{\milli\meter}).
+Auf Empfängerseite würde dies -- über den Pfad \texttt{get\_area\_mm2()} $\rightarrow$ \texttt{nominal\_area / average\_area} -- einen Division-durch-Null-Fehler oder extreme Extrusionsmultiplikatoren auslösen.
+
+\section{Code-Provenienz und Drittquellen}
+\label{sec:sensor_citations}
+
+Da die Firmware auf dem STM32F446RE (NUCLEO-Board) aufsetzt, enthält die Build-Kette platformspezifischen \textbf{HAL-Initialisierungscode} (ADC-Konfiguration, UART-Konfiguration, Taktbaum-Setup), der vom STM32CubeMX-Codegenerator erzeugt wird.
+Dieser maschinengenerierte Code ist in zahlreichen öffentlich verfügbaren STM32-Projekten nahezu identisch anzutreffen.
+Eine automatisierte Ähnlichkeitsanalyse (vgl.\ \texttt{src/\# Code Citations.md}) identifizierte Überschneidungen mit folgenden Quellcode-Repositorien:
+
+\begin{center}
+  \begin{tabular}{l l l}
+    \toprule
+    Repository & Lizenz & Übereinstimmender Code \\
+    \midrule
+    \texttt{taniho0707/Ikaru} & MIT & ADC-Init \\
+    \texttt{grifcj/stm32-adc} & unbekannt & ADC-Init \\
+    \texttt{RT-Thread/rt-thread} & Apache-2.0 & ADC-Init, Taktbaum \\
+    \texttt{gbrault/NucleoHal} & unbekannt & Taktbaum \\
+    \texttt{CalSMV/lux} & unbekannt & Taktbaum \\
+    \texttt{Ajay-Embed/TMP102-STM32F446RE} & unbekannt & Taktbaum \\
+    \texttt{c3charvat/WSU\_AIRFOIL\_PROJECT} & unbekannt & Taktbaum \\
+    \texttt{rijesha/Pavo} & unbekannt & Taktbaum \\
+    \texttt{zxtxin/oscilloscope\_chars} & unbekannt & Taktbaum \\
+    \texttt{semicontinuity/embedded} & unbekannt & UART-Init, MSP-Init \\
+    \texttt{LiteOS/LiteOS} & BSD-3-Clause & UART-Init, MSP-Init \\
+    \texttt{KasVar/ToheraGps} & unbekannt & UART-Init, MSP-Init \\
+    \texttt{YHF-1404/wulianwang} & unbekannt & UART-Init, MSP-Init \\
+    \bottomrule
+  \end{tabular}
+\end{center}
+
+Sämtliche identifizierten Überschneidungen betreffen ausschließlich drei Kategorien von vollständig generischem, maschinengenerierten STM32-HAL-Code:
+\begin{enumerate}
+  \item \textbf{ADC-Peripherie-Initialisierung} (\texttt{MX\_ADC1\_Init}): Standard-CubeMX-Template für 12-Bit-Single-Conversion-Modus mit Software-Trigger.
+  \item \textbf{UART-Peripherie-Initialisierung} (\texttt{MX\_USART1\_UART\_Init}, \texttt{HAL\_UART\_MspInit}): Standard-CubeMX-Template für USART1 bei \qty{115200}{\baud}, 8N1, inklusive GPIO-Pin-Konfiguration.
+  \item \textbf{Taktbaum-Konfiguration} (\texttt{SystemClock\_Config}): Standard-CubeMX-Template für HSI-PLL-basierte Taktung des STM32F4.
+\end{enumerate}
+
+Diese Code-Fragmente werden von \textbf{STM32CubeMX} \emph{automatisch generiert} und sind daher in jeder STM32-Anwendung, die denselben Peripherie-Satz verwendet, formal identisch.
+Die eigentliche Applikationslogik des Sensormoduls (Oversampling, Linearisierung, Fixed-Point-Formatierung, I\textsuperscript{2}C-Slave-Protokoll, Kalibrierlogik, Thread-Architektur) weist \textbf{keine} Übereinstimmungen mit den genannten Repositorien auf und ist eigenständig implementiert.
+
+\section{Bekannte Grenzen und technische Risiken}
+
+\begin{enumerate}
+  \item \textbf{Keine persistente Kalibrierung:} Kalibrierungsdaten liegen ausschließlich im RAM. Ein Neustart erfordert erneute Kalibrierung oder Nutzung der kompilierten Standardwerte.
+  \item \textbf{Keine sensormodul-seitige Ausreißerbehandlung:} Das Modul liefert ungefilterte Einzelmesswerte (lediglich burst-gemittelt). Plausibilitätsprüfung und Ausreißerunterdrückung müssen auf Empfängerseite (Drucker-Firmware, vgl.\ Kapitel~\ref{chap:filwidth}) erfolgen.
+  \item \textbf{Extrapolation außerhalb des Kalibrierbereichs:} Bei ADC-Werten jenseits $[\mathtt{raw}_0, \mathtt{raw}_2]$ liefert die lineare Extrapolation möglicherweise physikalisch unsinnige Durchmesser (vgl.\ Abschnitt~\ref{sec:sensor_linearisierung}).
+  \item \textbf{Zeitbasis nicht deterministisch:} Die effektive Messperiode hängt vom Thread-Scheduling und der Systemlast ab. Die nominalen \qty{2}{\milli\second} sind ein Mindestwert, keine harte Echtzeitgarantie.
+  \item \textbf{Interrupt-Sperre als Synchronisationsprimitiv:} \texttt{\_\_disable\_irq()} ist für den aktuellen \num{10}-Byte-\texttt{memcpy} unkritisch ($<\qty{1}{\micro\second}$), skaliert jedoch nicht für längere kritische Abschnitte. Bei einer künftigen Erweiterung des Payload-Formats sollte ein Mutex oder Double-Buffering erwogen werden.
+\end{enumerate}
+
+\section{Zusammenfassung}
+
+Der logische Aufbau der Sensormodul-Firmware gliedert sich in drei Stufen:
+\begin{enumerate}
+  \item \textbf{Messwertaufnahme:} Abfrage der Sensoren mittels 16-fachem Überabtasten und stückweise linearer 3-Punkt-Skalierung.
+  \item \textbf{Signalverarbeitung:} Konvertierung des metrischen Floating-Point-Wertes in eine Festkommazahl und anschließende Zerlegung in Einzelziffern.
+  \item \textbf{Kommunikation:} Eventbasierte I\textsuperscript{2}C-Slave-Routine mit atomarem Pufferzugriff.
+\end{enumerate}
+
+Diese Firmware generiert die Eingangsdaten für die in Kapitel~\ref{chap:filwidth} beschriebene volumetrische Kompensation.
+Auf eine softwareseitige Glättung im Sensormodul (ab FW~0.6.0) wird verzichtet. Durch die Übertragung weitgehend ungefilterter Messwerte bei $\approx \qty{500}{\hertz}$ verlagert sich die Datenbereinigung und Filterung vollständig auf die Drucker-Firmware (vgl.\ Kapitel~\ref{chap:filwidth}, Abschnitt~\ref{lst:lookahead_simulator}).

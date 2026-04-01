@@ -20,8 +20,8 @@ Systemgrenze dieser Dokumentation:
   - SCL: `PB_8`
   - Adresse (8-bit): `0x84` (entspricht 7-bit `0x42`)
 - Bedienelemente:
-  - Kalibrierstart: `PB_6` (Pull-up)
-  - Kalibrierschritt: `PB_7` (Pull-up)
+  - Kalibrierstart: `PB_6` / Arduino D10 (Pull-up)
+  - Kalibrierschritt: `PA_9` / Arduino D8 (Pull-up)
 - Statusausgabe:
   - LED: `PA_5`
   - UART/USB-Serial: 115200 Baud
