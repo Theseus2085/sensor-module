@@ -1,0 +1,30 @@
+﻿      -------------------------------------------------------------------
+                       STM32CubeProgrammer v2.21.0                  
+      -------------------------------------------------------------------
+
+ST-LINK SN  : 066FFF313746353043025415
+ST-LINK FW  : V2J33M25
+Board       : NUCLEO-F446RE 
+Voltage     : 3.25V
+SWD freq    : 4000 KHz
+Connect mode: Normal
+Reset mode  : Software reset
+Device ID   : 0x421
+Revision ID : Rev A
+Device name : STM32F446xx
+Flash size  : 512 KBytes
+Device type : MCU
+Device CPU  : Cortex-M4
+BL Version  : 0x90
+
+
+UPLOADING ...
+  File          : c:\Users\groll1960\projects\sensor-module\flash_kvstore.bin
+  Size          : 262144 Bytes
+  Address:      : 0x8040000
+Read progress:
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒ 0%
+██████████████████████████████████████████████████ 100%
+
+Data read successfully
+Time elapsed during read operation is: 00:00:02.127

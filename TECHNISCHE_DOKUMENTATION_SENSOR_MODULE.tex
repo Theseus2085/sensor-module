@@ -14,7 +14,7 @@ Im Gesamtsystem (vgl.\ Abbildung~\ref{fig:dataflow_overview}\todo{ggf.\ Verweis 
 
 \textbf{Verarbeitungsschritte eines Messwertes im Sensormodul:}
 \begin{enumerate}
-  \item \textbf{ADC-Burst-Oversampling:} Erfassung der analogen Hall-Sensorspannung über \num{16} Einzelmessungen pro Kanal und arithmetische Mittelung (Abschnitt~\ref{sec:sensor_adc}).
+  \item \textbf{ADC-Burst-Oversampling:} Erfassung der analogen Hall-Sensorspannung über \num{32} Einzelmessungen pro Kanal und arithmetische Mittelung (Abschnitt~\ref{sec:sensor_adc}).
   \item \textbf{Linearisierung:} Umrechnung des gemittelten ADC-Rohwerts in einen metrischen Durchmesser (Millimeter) mittels stückweise linearer Interpolation über drei Kalibrierungspunkte (Abschnitt~\ref{sec:sensor_linearisierung}).
   \item \textbf{Fixed-Point-Skalierung:} Umwandlung des Gleitkomma-Durchmessers in ein \num{10000}-fach skaliertes Ganzzahlformat (Abschnitt~\ref{sec:sensor_formatierung}).
   \item \textbf{Ziffernformatierung:} Zerlegung des skalierten Werts in fünf einzelne Dezimalziffern (Bytewerte \texttt{0\dots9}).
@@ -43,6 +43,7 @@ Im Gesamtsystem (vgl.\ Abbildung~\ref{fig:dataflow_overview}\todo{ggf.\ Verweis 
     \begin{itemize}
       \item Kalibrier-Start-Taster: \texttt{PB\_6} / Arduino D10 (Pull-Up)
       \item Kalibrier-Schritt-Taster: \texttt{PA\_9} / Arduino D8 (Pull-Up)
+      \item Logging-Toggle-Taster: \texttt{PB\_5} / Arduino D4 (Pull-Up)
     \end{itemize}
   \item \textbf{Statusausgabe:} LED auf \texttt{PA\_5}, USB-Serial bei \qty{115200}{\baud}.
 \end{itemize}
@@ -64,7 +65,7 @@ Das mbed-OS-API \texttt{I2CSlave::address()} erwartet die 8-Bit-Form (\texttt{0x
       \item \texttt{env:nucleo\_f446re} -- Produktiv-Target
       \item \texttt{env:nucleo\_f446re\_dbg} -- Debug-Target mit I\textsuperscript{2}C-Instrumentierung (\texttt{-DI2C\_DEBUG\_ENABLE=1}, konfigurierbare Event-Queue und Print-Periode)
     \end{itemize}
-  \item \textbf{Referenzdatei:} \texttt{src/main.cpp} (FW~0.6.0, \num{394}~Zeilen)
+  \item \textbf{Referenzdatei:} \texttt{src/main.cpp} (FW~0.6.0, \num{530}~Zeilen)
 \end{itemize}
 
 \section{Laufzeitarchitektur (Nebenläufigkeit)}
@@ -90,13 +91,28 @@ Dadurch wird verhindert, dass I\textsuperscript{2}C-Bustransaktionen die determi
       \item Reine Lebendanzeige (\qty{200}{\milli\second} Ein / \qty{200}{\milli\second} Aus).
       \item Funktional vollständig von der Messkette entkoppelt -- blinkt auch bei Blockade des Main-Threads weiter.
     \end{itemize}
+  \item \textbf{UART-Stream-Thread} (\texttt{uart\_stream\_thread}, \texttt{osPriorityNormal}):
+    \begin{itemize}
+      \item Telemetrie-Ausgabe über den Hardware-UART (\texttt{PB\_10} / Arduino D6) an eine externe Arduino-Mega-Bridge.
+      \item Tastergesteuert (\texttt{PB\_5} / Arduino D4): Pro Tastendruck wird genau ein Messpunkt als CSV-Zeile ausgegeben.
+      \item Jede Zeile enthält: laufenden Index, burst-gemittelten Durchmesser beider Sensoren sowie den 2.~Rohwert des Bursts als Rauschvergleich.
+    \end{itemize}
 \end{enumerate}
 
-\begin{lstlisting}[style=firmwarestyle, caption={Thread-Erzeugung und Initialisierung in \texttt{main()} (\texttt{main.cpp}, Z.~311--361).}, label={lst:sensor_thread_creation}]
+\begin{lstlisting}[style=firmwarestyle, caption={Thread-Erzeugung und Initialisierung in \texttt{main()} (\texttt{main.cpp}, Z.~435--528).}, label={lst:sensor_thread_creation}]
 int main() {
   led = 1;
 
-  // ... (UART-Banner, Pre-fill des I2C-Puffers auf 1.75 mm)
+  // UART-Banner ...
+  load_calibration_from_flash(); // KVStore -> RAM
+
+  // Pre-fill I2C buffer with safe data FIRST
+  sensor1_mm = 1.75f;
+  sensor2_mm = 1.75f;
+  format_sensor_data_fixed(
+    mm_to_fixed_10000(1.75f), (uint8_t*)&tx_buffer[0]);
+  format_sensor_data_fixed(
+    mm_to_fixed_10000(1.75f), (uint8_t*)&tx_buffer[5]);
 
   // Initial measurement with real ADC data
   measure_sensor_values();
@@ -120,6 +136,10 @@ int main() {
   Thread led_thread(osPriorityNormal);
   led_thread.start(led_heartbeat_thread);
 
+  // UART stream thread: button-triggered telemetry to Mega bridge
+  Thread uart_thread(osPriorityNormal);
+  uart_thread.start(uart_stream_thread);
+
   ThisThread::sleep_for(200ms);
 
   // Main loop: continuous measurement + atomic buffer update
@@ -135,19 +155,24 @@ int main() {
 
 \minisec{ADC-Burst-Oversampling}
 
-Pro Messkanal werden \num{16} aufeinanderfolgende Einzelmessungen des 12-Bit-ADC durchgeführt und arithmetisch gemittelt.
-Dies realisiert einen \textbf{diskreten Tiefpass erster Ordnung} (FIR-Filter mit rechteckigem Fenster der Länge~\num{16}), der hochfrequentes Rauschen um ca.\ $10 \cdot \log_{10}(16) \approx \qty{12}{\deci\bel}$ reduziert, bevor der Wert in die Linearisierung eingeht.
+Pro Messkanal werden \num{32} aufeinanderfolgende Einzelmessungen des 12-Bit-ADC durchgeführt und arithmetisch gemittelt.
+Dies realisiert einen \textbf{diskreten Tiefpass erster Ordnung} (FIR-Filter mit rechteckigem Fenster der Länge~\num{32}), der hochfrequentes Rauschen um ca.\ $10 \cdot \log_{10}(32) \approx \qty{15}{\deci\bel}$ reduziert, bevor der Wert in die Linearisierung eingeht.
+Zusätzlich wird der zweite Rohwert des Bursts (Index~1) in \texttt{burst\_second\_sample[sensor\_idx]} zwischengespeichert und dem UART-Stream-Thread zur Rauschanalyse bereitgestellt.
 
-\begin{lstlisting}[style=firmwarestyle, caption={ADC-Burst-Oversampling (\texttt{read\_sensor\_raw\_adc}, Z.~115--127).}, label={lst:sensor_adc_burst}]
+\begin{lstlisting}[style=firmwarestyle, caption={ADC-Burst-Oversampling mit Rohwert-Capture (\texttt{read\_sensor\_raw\_adc}, Z.~157--173).}, label={lst:sensor_adc_burst}]
 uint16_t read_sensor_raw_adc(uint8_t sensor_idx) {
   AnalogIn* sensor_pin =
     (sensor_idx == 0) ? &sensor1 : &sensor2;
 
-  // Oversample with 16-sample burst (12-bit ADC)
-  const int burstCount = 16;
+  // Oversample with 32-sample burst (12-bit ADC)
+  const int burstCount = 32;
   int32_t burstSum = 0;
   for (int k = 0; k < burstCount; k++) {
-    burstSum += (uint16_t)(sensor_pin->read() * 4095.0f);
+    uint16_t val = (uint16_t)(sensor_pin->read() * 4095.0f);
+    if (k == 1) { // 2nd sample in the burst (index 1)
+      burst_second_sample[sensor_idx] = val;
+    }
+    burstSum += val;
   }
 
   uint16_t averaged = (uint16_t)(burstSum / burstCount);
@@ -172,7 +197,7 @@ Ebenfalls entfernt wurde die \texttt{last\_valid\_raw}-Logik (FW~$\leq$~0.5.x), 
 Die Umrechnung vom gemittelten ADC-Rohwert in den physikalischen Durchmesser (Millimeter) erfolgt je Sensor über eine \textbf{stückweise lineare Interpolation} mit drei Kalibrierungspunkten.
 
 Die Kalibrierungstabelle wird als Struktur im Speicher vorgehalten:
-\begin{lstlisting}[style=firmwarestyle, caption={Kalibrierdatenstruktur (\texttt{main.cpp}, Z.~73--89).}, label={lst:sensor_cal_table}]
+\begin{lstlisting}[style=firmwarestyle, caption={Kalibrierdatenstruktur mit sensorspezifischen Standardwerten (\texttt{main.cpp}, Z.~89--101).}, label={lst:sensor_cal_table}]
 struct CalibrationPoint {
   uint16_t raw_adc;
   float diameter_mm;
@@ -180,22 +205,27 @@ struct CalibrationPoint {
 
 CalibrationPoint calibration_tables[2][3] = {
   { // Sensor 1
-    {7, 1.47f}, {532, 1.68f}, {1119, 1.99f}
+    {401, 1.65f}, {656, 1.75f}, {867, 1.85f}
   },
   { // Sensor 2
-    {7, 1.47f}, {532, 1.68f}, {1119, 1.99f}
+    {703, 1.65f}, {900, 1.75f}, {1063, 1.85f}
   }
 };
 \end{lstlisting}
 
-Die Standardwerte bei Programmstart lauten:
+Die kompilierten Standardwerte sind sensorspezifisch kalibriert und dienen als Fallback, wenn beim Systemstart kein gespeicherter KVStore-Datensatz gefunden wird.
+Sie decken den praxisrelevanten Messbereich von \qty{1,65}{\milli\meter} bis \qty{1,85}{\milli\meter} ab.
+
 \begin{center}
-  \begin{tabular}{l c c c}
+  \begin{tabular}{l c c c c}
     \toprule
-    & Punkt 0 & Punkt 1 & Punkt 2 \\
+    & & Punkt 0 & Punkt 1 & Punkt 2 \\
     \midrule
-    $\mathtt{raw}$ & 7 & 532 & 1119 \\
-    $d$ [\unit{\milli\meter}] & 1{,}47 & 1{,}68 & 1{,}99 \\
+    Sensor~1 & $\mathtt{raw}$ & 401 & 656 & 867 \\
+             & $d$ [\unit{\milli\meter}] & 1{,}65 & 1{,}75 & 1{,}85 \\
+    \midrule
+    Sensor~2 & $\mathtt{raw}$ & 703 & 900 & 1063 \\
+             & $d$ [\unit{\milli\meter}] & 1{,}65 & 1{,}75 & 1{,}85 \\
     \bottomrule
   \end{tabular}
 \end{center}
@@ -265,7 +295,7 @@ $D_\text{eq} = \sqrt{D_X \cdot D_Y}$.
 \section{Kalibrierprozess}
 \label{sec:sensor_kalibrierung}
 
-Die Kalibrierung wird durch den Taster an \texttt{PB\_6} / Arduino D10 (Start) initiiert und durchläuft für beide Sensoren jeweils drei Referenzpunkte bei den Soll-Durchmessern \qty{1,50}{\milli\meter}, \qty{1,75}{\milli\meter} und \qty{2,00}{\milli\meter}.
+Die Kalibrierung wird durch den Taster an \texttt{PB\_6} / Arduino D10 (Start) initiiert und durchläuft für beide Sensoren jeweils drei Referenzpunkte bei den Soll-Durchmessern \qty{1,65}{\milli\meter}, \qty{1,75}{\milli\meter} und \qty{1,85}{\milli\meter}.
 
 \textbf{Ablauf:}
 \begin{enumerate}
@@ -274,22 +304,20 @@ Die Kalibrierung wird durch den Taster an \texttt{PB\_6} / Arduino D10 (Start) i
     \begin{enumerate}
       \item Aufforderung über USB-Serial.
       \item Benutzer legt die zugehörige Kalibrierungsreferenz ein und betätigt den \texttt{NEXT}-Taster (\texttt{PA\_9} / Arduino D8).
-      \item ADC-Rohwert wird via \texttt{read\_sensor\_raw\_adc(s)} erfasst und mit dem Soll-Durchmesser gepaart.
+      \item Es wird eine \textbf{tiefe zeitliche Mittelung} durchgeführt: \num{32} Burst-Ablesungen (via \texttt{read\_sensor\_raw\_adc()}) im Abstand von je \qty{5}{\milli\second} werden aufsummiert und arithmetisch gemittelt (Gesamtdauer~$\approx \qty{160}{\milli\second}$). Der resultierende ADC-Rohwert wird mit dem Soll-Durchmesser gepaart.
       \item \qty{50}{\milli\second} Entprellung nach Tastendruck und -freigabe.
     \end{enumerate}
   \item \textbf{Übernahme:} Die neuen Kalibrierungspunkte ersetzen sofort die Einträge in \texttt{calibration\_tables[s][p]}.
+  \item \textbf{Persistierung:} Nach Abschluss aller sechs Messpunkte wird die gesamte Kalibrierungstabelle via \texttt{kv\_set()} persistent im internen Flash gespeichert (siehe Abschnitt~\ref{sec:sensor_cal_persistence}).
 \end{enumerate}
-
-\textbf{Einschränkung:} Die Kalibrierungsdaten liegen ausschließlich im RAM (volatil).
-Nach einem Reset oder Power-Cycle gehen benutzerdefinierte Kalibrierungen verloren und die Firmware fällt auf die kompilierten Standardwerte zurück.
 
 Während der Wartephase auf den \texttt{NEXT}-Taster wird die Messwerterfassung (\texttt{measure\_sensor\_values()}) weiterhin alle \qty{10}{\milli\second} aufgerufen, sodass der I\textsuperscript{2}C-Sendepuffer auch während der Kalibrierung stets einen aktuellen Frame enthält.
 
-\begin{lstlisting}[style=firmwarestyle, caption={Kalibrierprozedur (\texttt{calibration}, Z.~170--209).}, label={lst:sensor_calibration}]
+\begin{lstlisting}[style=firmwarestyle, caption={Kalibrierprozedur mit tiefer zeitlicher Mittelung und Flash-Persistierung (\texttt{calibration}, Z.~204--258).}, label={lst:sensor_calibration}]
 void calibration(void) {
   printf("\n=== Calibration Started ===\n");
 
-  float diameters[] = {1.50f, 1.75f, 2.00f};
+  float diameters[] = {1.65f, 1.75f, 1.85f};
 
   // Pre-fill buffer output to safe 1.75mm
   sensor1_mm = 1.75f;
@@ -313,9 +341,14 @@ void calibration(void) {
       }
       ThisThread::sleep_for(50ms);
 
-      // Capture calibration point
+      // Deep temporal averaging: 32 bursts over ~160ms
+      uint32_t cal_sum = 0;
+      for (int i = 0; i < 32; i++) {
+        cal_sum += read_sensor_raw_adc(s);
+        ThisThread::sleep_for(5ms);
+      }
       calibration_tables[s][p].raw_adc =
-        read_sensor_raw_adc(s);
+        (uint16_t)(cal_sum / 32);
       calibration_tables[s][p].diameter_mm = diameters[p];
 
       // Wait for button release + debounce
@@ -325,9 +358,74 @@ void calibration(void) {
       ThisThread::sleep_for(50ms);
     }
   }
+
+  // Persist to internal flash via KVStore
+  int ret = kv_set(CAL_KV_KEY, (const void*)calibration_tables,
+                   sizeof(calibration_tables), 0);
+  if (ret == MBED_SUCCESS) {
+    printf("Calibration saved to Internal Flash!\n");
+  } else {
+    printf("Warning: Flash save failed (error %d)\n", ret);
+  }
   printf("=== Calibration Complete ===\n\n");
 }
 \end{lstlisting}
+
+\minisec{Persistente Speicherung der Kalibrierungsdaten}
+\label{sec:sensor_cal_persistence}
+
+Die Kalibrierungsdaten werden über das mbed-OS \textbf{KVStore-API} (Key-Value Store) persistent im internen Flash-Speicher des STM32F446RE abgelegt.
+Das verwendete Backend ist \texttt{TDB\_INTERNAL} (TinyDB auf internem Flash), konfiguriert in \texttt{mbed\_app.json}:
+
+\begin{lstlisting}[style=firmwarestyle, caption={KVStore-Konfiguration (\texttt{mbed\_app.json}).}, label={lst:sensor_kvstore_config}]
+{"target_overrides": {
+    "*": {"storage.storage_type": "TDB_INTERNAL"}
+}}
+\end{lstlisting}
+
+Der KV-Schlüssel \texttt{/kv/cal\_tables} referenziert die gesamte Kalibrierungstabelle beider Sensoren als zusammenhängenden binären Block (\num{24}~Bytes: $2 \times 3 \times (\texttt{uint16\_t} + \texttt{float})$).
+Beim Systemstart ruft \texttt{main()} die Funktion \texttt{load\_calibration\_from\_flash()} auf:
+
+\begin{lstlisting}[style=firmwarestyle, caption={Laden der persistierten Kalibrierung beim Systemstart mit Dump-Ausgabe (\texttt{load\_calibration\_from\_flash}, Z.~128--155).}, label={lst:sensor_cal_load}]
+void load_calibration_from_flash() {
+  size_t actual_size = 0;
+  int ret = kv_get(CAL_KV_KEY,
+    (void*)calibration_tables,
+    sizeof(calibration_tables), &actual_size);
+  if (ret == MBED_SUCCESS
+      && actual_size == sizeof(calibration_tables)) {
+    printf("Loaded persistent calibration "
+           "from internal flash (size: %u)\n",
+           actual_size);
+  } else {
+    printf("No persistent calibration found, "
+           "using standard defaults.\n");
+  }
+
+  // Dump active table in copy-pasteable C format
+  printf("\n--- Active Calibration Table "
+         "(copy-paste into source) ---\n");
+  printf("CalibrationPoint calibration_tables[2][3] = {\n");
+  for (int s = 0; s < 2; s++) {
+    printf("  { // Sensor %d\n", s + 1);
+    for (int p = 0; p < 3; p++) {
+      int d_int = (int)calibration_tables[s][p].diameter_mm;
+      int d_frac = (int)(
+        (calibration_tables[s][p].diameter_mm - d_int)
+        * 100 + 0.5f);
+      printf("    {%u, %d.%02df}%s\n",
+        calibration_tables[s][p].raw_adc,
+        d_int, d_frac, (p < 2) ? "," : "");
+    }
+    printf("  }%s\n", (s < 1) ? "," : "");
+  }
+  printf("};\n--- End Calibration Table ---\n\n");
+}
+\end{lstlisting}
+
+Der UART-Dump gibt die aktive Kalibrierungstabelle in syntaktisch korrekter C-Form aus, sodass gemessene Kalibrierwerte direkt als Standardwerte in den Quellcode übernommen werden können, ohne die KVStore-Abhängigkeit zu benötigen.
+
+Ist kein gespeicherter Datensatz vorhanden (z.\,B.\ beim allerersten Programmstart oder nach einem vollständigen Re-Flash), bleiben die kompilierten Standardwerte erhalten.
 
 \section{Datenformatierung und I\textsuperscript{2}C-Kommunikation}
 \label{sec:sensor_formatierung}
@@ -606,7 +704,7 @@ Die eigentliche Applikationslogik des Sensormoduls (Oversampling, Linearisierung
 \section{Bekannte Grenzen und technische Risiken}
 
 \begin{enumerate}
-  \item \textbf{Keine persistente Kalibrierung:} Kalibrierungsdaten liegen ausschließlich im RAM. Ein Neustart erfordert erneute Kalibrierung oder Nutzung der kompilierten Standardwerte.
+  \item \textbf{Abhängigkeit vom internen Flash:} Die persistente Kalibrierung nutzt den internen Flash-Speicher des STM32F446RE über das KVStore-API (vgl.\ Abschnitt~\ref{sec:sensor_cal_persistence}). Ein vollständiges Re-Flash der Firmware löscht den KVStore-Bereich und setzt die Kalibrierdaten auf die kompilierten Standardwerte zurück.
   \item \textbf{Keine sensormodul-seitige Ausreißerbehandlung:} Das Modul liefert ungefilterte Einzelmesswerte (lediglich burst-gemittelt). Plausibilitätsprüfung und Ausreißerunterdrückung müssen auf Empfängerseite (Drucker-Firmware, vgl.\ Kapitel~\ref{chap:filwidth}) erfolgen.
   \item \textbf{Extrapolation außerhalb des Kalibrierbereichs:} Bei ADC-Werten jenseits $[\mathtt{raw}_0, \mathtt{raw}_2]$ liefert die lineare Extrapolation möglicherweise physikalisch unsinnige Durchmesser (vgl.\ Abschnitt~\ref{sec:sensor_linearisierung}).
   \item \textbf{Zeitbasis nicht deterministisch:} Die effektive Messperiode hängt vom Thread-Scheduling und der Systemlast ab. Die nominalen \qty{2}{\milli\second} sind ein Mindestwert, keine harte Echtzeitgarantie.
@@ -617,10 +715,11 @@ Die eigentliche Applikationslogik des Sensormoduls (Oversampling, Linearisierung
 
 Der logische Aufbau der Sensormodul-Firmware gliedert sich in drei Stufen:
 \begin{enumerate}
-  \item \textbf{Messwertaufnahme:} Abfrage der Sensoren mittels 16-fachem Überabtasten und stückweise linearer 3-Punkt-Skalierung.
+  \item \textbf{Messwertaufnahme:} Abfrage der Sensoren mittels 32-fachem Überabtasten und stückweise linearer 3-Punkt-Skalierung.
   \item \textbf{Signalverarbeitung:} Konvertierung des metrischen Floating-Point-Wertes in eine Festkommazahl und anschließende Zerlegung in Einzelziffern.
   \item \textbf{Kommunikation:} Eventbasierte I\textsuperscript{2}C-Slave-Routine mit atomarem Pufferzugriff.
 \end{enumerate}
 
 Diese Firmware generiert die Eingangsdaten für die in Kapitel~\ref{chap:filwidth} beschriebene volumetrische Kompensation.
 Auf eine softwareseitige Glättung im Sensormodul (ab FW~0.6.0) wird verzichtet. Durch die Übertragung weitgehend ungefilterter Messwerte bei $\approx \qty{500}{\hertz}$ verlagert sich die Datenbereinigung und Filterung vollständig auf die Drucker-Firmware (vgl.\ Kapitel~\ref{chap:filwidth}, Abschnitt~\ref{lst:lookahead_simulator}).
+Der UART-Stream-Thread ermöglicht zudem eine tastergesteuerte Telemetrieerfassung, bei der für jeden Messpunkt sowohl der burst-gemittelte als auch der zweite Rohwert des Bursts ausgegeben werden; dies erlaubt eine vergleichende Rauschanalyse im Betrieb.

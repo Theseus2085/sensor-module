@@ -1,0 +1,7 @@
+{
+    "target_overrides": {
+        "*": {
+            "storage.storage_type": "TDB_INTERNAL"
+        }
+    }
+}

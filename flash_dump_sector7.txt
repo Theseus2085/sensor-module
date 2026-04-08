@@ -1,0 +1,9 @@
+﻿      -------------------------------------------------------------------
+                       STM32CubeProgrammer v2.21.0                  
+      -------------------------------------------------------------------
+
+ST-LINK SN  : 066FFF313746353043025415
+ST-LINK FW  : V2J33M25
+Board       : NUCLEO-F446RE 
+Voltage     : 3.25V
+Error: No STM32 target found! If your product embeds Debug Authentication, please perform a discovery using Debug Authentication

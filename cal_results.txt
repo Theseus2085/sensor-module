@@ -1,0 +1,55 @@
+﻿Flash dump size: 262144 bytes
+Base address: 0x08040000
+
+Found 6 occurrences of float 1.75 in flash dump
+
+Found 2 valid calibration table(s):
+
+=== Table 1 at flash dump offset 0x00008E (flash addr 0x0804008E) ===
+
+// --- Copy-paste this into main.cpp (line ~95) ---
+CalibrationPoint calibration_tables[2][3] = {
+  { // Sensor 1
+    {420, 1.65f},
+    {665, 1.75f},
+    {867, 1.85f}
+  },
+  { // Sensor 2
+    {697, 1.65f},
+    {896, 1.75f},
+    {1061, 1.85f}
+  }
+};
+
+Raw values:
+  Sensor 1, Point 1: raw_adc=420, diameter=1.6500 mm
+  Sensor 1, Point 2: raw_adc=665, diameter=1.7500 mm
+  Sensor 1, Point 3: raw_adc=867, diameter=1.8500 mm
+  Sensor 2, Point 1: raw_adc=697, diameter=1.6500 mm
+  Sensor 2, Point 2: raw_adc=896, diameter=1.7500 mm
+  Sensor 2, Point 3: raw_adc=1061, diameter=1.8500 mm
+
+=== Table 2 at flash dump offset 0x000132 (flash addr 0x08040132) ===
+
+// --- Copy-paste this into main.cpp (line ~95) ---
+CalibrationPoint calibration_tables[2][3] = {
+  { // Sensor 1
+    {401, 1.65f},
+    {656, 1.75f},
+    {867, 1.85f}
+  },
+  { // Sensor 2
+    {703, 1.65f},
+    {900, 1.75f},
+    {1063, 1.85f}
+  }
+};
+
+Raw values:
+  Sensor 1, Point 1: raw_adc=401, diameter=1.6500 mm
+  Sensor 1, Point 2: raw_adc=656, diameter=1.7500 mm
+  Sensor 1, Point 3: raw_adc=867, diameter=1.8500 mm
+  Sensor 2, Point 1: raw_adc=703, diameter=1.6500 mm
+  Sensor 2, Point 2: raw_adc=900, diameter=1.7500 mm
+  Sensor 2, Point 3: raw_adc=1063, diameter=1.8500 mm
+
