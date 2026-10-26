@@ -16,6 +16,12 @@
  * - SDA: PB9 - Connect to printer's I2C SDA D8
  * - GND: Common ground required
  *
+ * I2C payload (12 bytes):
+ * - Bytes 0-4:  axis 1 diameter digits (value x 10000, binary digit values)
+ * - Bytes 5-9:  axis 2 diameter digits (value x 10000, binary digit values)
+ * - Byte 10:    protocol version (SENSOR_PROTOCOL_VERSION)
+ * - Byte 11:    CRC8 (poly 0x07, init 0x00) over bytes 0-10
+ *
  * Framework: mbed OS
  */
 
@@ -25,7 +31,10 @@
 // FIRMWARE CONFIGURATION
 // ============================================================================
 
-#define FW_VERSION "0.6.0"
+#define FW_VERSION "0.7.0"
+
+// Payload version byte; must match printer FILWIDTH_SENSOR_PROTOCOL_VERSION.
+#define SENSOR_PROTOCOL_VERSION 0x01
 
 // ============================================================================
 // PIN DEFINITIONS
@@ -59,12 +68,11 @@ DigitalIn cal_next_btn(PA_9, PullUp); // Arduino D8
 #if TEST_MODE
 #define TEST_SENSOR1_MM 1.99f
 #define TEST_SENSOR2_MM 1.99f
-#define TEST_SENSOR1_X10000 ((uint32_t)(TEST_SENSOR1_MM * 10000.0f + 0.5f))
-#define TEST_SENSOR2_X10000 ((uint32_t)(TEST_SENSOR2_MM * 10000.0f + 0.5f))
 #endif
 
 #define SENSOR_MM_FIXED_SCALE 10000U
 #define SENSOR_MM_FIXED_MAX 99999U
+#define SENSOR_PAYLOAD_BYTES 12 // 10 data bytes + version byte + CRC8
 
 /* Sensor Measurements */
 volatile float sensor1_mm = 1.75f;
@@ -86,7 +94,7 @@ CalibrationPoint calibration_tables[2][3] = {{// Sensor 1
                                               {1119, 1.99f}}};
 
 /* I2C Communication Buffer */
-volatile uint8_t tx_buffer[10] = {0};
+volatile uint8_t tx_buffer[SENSOR_PAYLOAD_BYTES] = {0};
 
 /* I2C Connection Status */
 volatile uint32_t i2c_request_count = 0;
@@ -102,6 +110,7 @@ Timer uptime_timer;
 
 uint32_t mm_to_fixed_10000(float val);
 void format_sensor_data_fixed(uint32_t val_x10000, uint8_t *buf);
+void build_payload(float s1_mm, float s2_mm, uint8_t *buf);
 void reinit_i2c_slave();
 uint64_t get_uptime_us();
 
@@ -129,6 +138,18 @@ float convert_raw_adc_to_mm(uint16_t raw_adc, uint8_t sensor_idx) {
   }
 
   const CalibrationPoint *table = calibration_tables[sensor_idx];
+
+  // Clamp to the calibrated envelope: linear extrapolation outside the captured
+  // points produced implausible diameters (e.g. on filament runout).
+  const uint16_t raw_lo =
+      (table[0].raw_adc < table[2].raw_adc) ? table[0].raw_adc : table[2].raw_adc;
+  const uint16_t raw_hi =
+      (table[0].raw_adc > table[2].raw_adc) ? table[0].raw_adc : table[2].raw_adc;
+  if (raw_adc < raw_lo)
+    raw_adc = raw_lo;
+  if (raw_adc > raw_hi)
+    raw_adc = raw_hi;
+
   float diameter;
 
   if (raw_adc <= table[1].raw_adc) {
@@ -176,8 +197,7 @@ void calibration(void) {
   // Pre-fill buffer output to safe 1.75mm
   sensor1_mm = 1.75f;
   sensor2_mm = 1.75f;
-  format_sensor_data_fixed(mm_to_fixed_10000(1.75f), (uint8_t *)&tx_buffer[0]);
-  format_sensor_data_fixed(mm_to_fixed_10000(1.75f), (uint8_t *)&tx_buffer[5]);
+  build_payload(1.75f, 1.75f, (uint8_t *)&tx_buffer[0]);
 
   for (int s = 0; s < 2; s++) {
     printf("Calibrating Sensor %d\n", s + 1);
@@ -233,6 +253,27 @@ void format_sensor_data_fixed(uint32_t val_x10000, uint8_t *buf) {
   buf[4] = val_x10000 % 10U;
 }
 
+/* CRC-8 (poly 0x07, init 0x00); must match crc8_frame in the printer firmware. */
+uint8_t crc8(const uint8_t *data, uint8_t length) {
+  uint8_t crc = 0;
+  for (uint8_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x80U) ? (uint8_t)((uint8_t)(crc << 1) ^ 0x07U)
+                          : (uint8_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+/* Builds the full 12-byte frame: 5 digits per axis + version byte + CRC8. */
+void build_payload(float s1_mm, float s2_mm, uint8_t *buf) {
+  format_sensor_data_fixed(mm_to_fixed_10000(s1_mm), buf);
+  format_sensor_data_fixed(mm_to_fixed_10000(s2_mm), buf + 5);
+  buf[10] = SENSOR_PROTOCOL_VERSION;
+  buf[11] = crc8(buf, 11);
+}
+
 uint64_t get_uptime_us() {
   // Timer::elapsed_time() reports microseconds on mbed chrono durations.
   return (uint64_t)uptime_timer.elapsed_time().count();
@@ -274,13 +315,12 @@ void i2c_slave_thread() {
 
       // In test mode, serve fixed test payload directly on each read.
 #if TEST_MODE
-      uint8_t test_payload[10];
-      format_sensor_data_fixed(TEST_SENSOR1_X10000, test_payload);
-      format_sensor_data_fixed(TEST_SENSOR2_X10000, test_payload + 5);
-      if (i2c_slave.write((const char *)test_payload, 10) != 0) {
+      uint8_t test_payload[SENSOR_PAYLOAD_BYTES];
+      build_payload(TEST_SENSOR1_MM, TEST_SENSOR2_MM, test_payload);
+      if (i2c_slave.write((const char *)test_payload, SENSOR_PAYLOAD_BYTES) != 0) {
 #else
       // Buffer is continuously refreshed by main loop; no copy/allocation here.
-      if (i2c_slave.write((const char *)tx_buffer, 10) != 0) {
+      if (i2c_slave.write((const char *)tx_buffer, SENSOR_PAYLOAD_BYTES) != 0) {
 #endif
         printf("I2C: read-response write failed, reinitializing slave\n");
         reinit_i2c_slave();
@@ -331,15 +371,11 @@ int main() {
   // Pre-fill I2C buffer with safe data FIRST
   sensor1_mm = 1.75f;
   sensor2_mm = 1.75f;
-  format_sensor_data_fixed(mm_to_fixed_10000(1.75f), (uint8_t *)&tx_buffer[0]);
-  format_sensor_data_fixed(mm_to_fixed_10000(1.75f), (uint8_t *)&tx_buffer[5]);
+  build_payload(1.75f, 1.75f, (uint8_t *)&tx_buffer[0]);
 
   // Initial measurement with real ADC data
   measure_sensor_values();
-  format_sensor_data_fixed(mm_to_fixed_10000(sensor1_mm),
-                           (uint8_t *)&tx_buffer[0]);
-  format_sensor_data_fixed(mm_to_fixed_10000(sensor2_mm),
-                           (uint8_t *)&tx_buffer[5]);
+  build_payload(sensor1_mm, sensor2_mm, (uint8_t *)&tx_buffer[0]);
 #endif
 
   // Start timers
@@ -386,12 +422,11 @@ int main() {
     measure_sensor_values();
 
     // Update I2C buffer atomically
-    uint8_t temp_buf[10];
-    format_sensor_data_fixed(mm_to_fixed_10000(sensor1_mm), temp_buf);
-    format_sensor_data_fixed(mm_to_fixed_10000(sensor2_mm), temp_buf + 5);
+    uint8_t temp_buf[SENSOR_PAYLOAD_BYTES];
+    build_payload(sensor1_mm, sensor2_mm, temp_buf);
 
     __disable_irq();
-    memcpy((void *)tx_buffer, temp_buf, 10);
+    memcpy((void *)tx_buffer, temp_buf, SENSOR_PAYLOAD_BYTES);
     __enable_irq();
 #endif
 
