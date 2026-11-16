@@ -31,7 +31,7 @@
 // FIRMWARE CONFIGURATION
 // ============================================================================
 
-#define FW_VERSION "0.7.0"
+#define FW_VERSION "0.7.1"
 
 // Payload version byte; must match printer FILWIDTH_SENSOR_PROTOCOL_VERSION.
 #define SENSOR_PROTOCOL_VERSION 0x01
@@ -139,6 +139,14 @@ float convert_raw_adc_to_mm(uint16_t raw_adc, uint8_t sensor_idx) {
 
   const CalibrationPoint *table = calibration_tables[sensor_idx];
 
+  // Work on a local, raw-ascending copy of the 3 points so the piecewise
+  // interpolation is independent of the order the calibration was captured in.
+  CalibrationPoint t[3] = {table[0], table[1], table[2]};
+  if (t[0].raw_adc > t[1].raw_adc) { CalibrationPoint tmp = t[0]; t[0] = t[1]; t[1] = tmp; }
+  if (t[1].raw_adc > t[2].raw_adc) { CalibrationPoint tmp = t[1]; t[1] = t[2]; t[2] = tmp; }
+  if (t[0].raw_adc > t[1].raw_adc) { CalibrationPoint tmp = t[0]; t[0] = t[1]; t[1] = tmp; }
+  table = t;
+
   // Clamp to the calibrated envelope: linear extrapolation outside the captured
   // points produced implausible diameters (e.g. on filament runout).
   const uint16_t raw_lo =
@@ -173,6 +181,21 @@ float convert_raw_adc_to_mm(uint16_t raw_adc, uint8_t sensor_idx) {
                  slope * (float)((int32_t)raw_adc - (int32_t)table[1].raw_adc);
     }
   }
+
+  // Clamp the result to the calibrated diameter envelope as well: with a
+  // hypothetically non-ascending capture order the piecewise interpolation
+  // could still leave the captured range even for raw values inside it.
+  float d_lo = table[0].diameter_mm, d_hi = table[0].diameter_mm;
+  for (int i = 1; i < 3; i++) {
+    if (table[i].diameter_mm < d_lo)
+      d_lo = table[i].diameter_mm;
+    if (table[i].diameter_mm > d_hi)
+      d_hi = table[i].diameter_mm;
+  }
+  if (diameter < d_lo)
+    diameter = d_lo;
+  if (diameter > d_hi)
+    diameter = d_hi;
 
   return diameter;
 }
@@ -351,6 +374,7 @@ void led_heartbeat_thread() {
 // MAIN FUNCTION
 // ============================================================================
 
+#ifndef PIO_UNIT_TESTING
 int main() {
   // LED on during init
   led = 1;
@@ -433,3 +457,4 @@ int main() {
     ThisThread::sleep_for(2ms);
   }
 }
+#endif // !PIO_UNIT_TESTING
